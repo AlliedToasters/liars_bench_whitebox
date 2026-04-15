@@ -42,6 +42,16 @@ MODEL_KEY_TO_HF = {
 }
 
 
+def _template_to_ids(tokenizer, messages, **kwargs) -> list[int]:
+    """apply_chat_template that always returns a plain list of ints."""
+    out = tokenizer.apply_chat_template(messages, tokenize=True, **kwargs)
+    if hasattr(out, "input_ids"):
+        out = out["input_ids"]
+    if isinstance(out, list) and len(out) > 0 and isinstance(out[0], list):
+        out = out[0]
+    return out
+
+
 def get_assistant_turn_boundaries(
     messages: list[dict],
     tokenizer: AutoTokenizer,
@@ -56,23 +66,21 @@ def get_assistant_turn_boundaries(
     boundaries = []
 
     # Build the full token sequence
-    full_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+    full_ids = _template_to_ids(tokenizer, messages)
 
     # Walk through messages, accumulating non-assistant turns as prefix
     prefix_messages = []
     for i, msg in enumerate(messages):
         if msg["role"] == "assistant":
             # Tokenize prefix with generation prompt to get start of assistant
-            prefix_ids = tokenizer.apply_chat_template(
-                prefix_messages, tokenize=True, add_generation_prompt=True,
+            prefix_ids = _template_to_ids(
+                tokenizer, prefix_messages, add_generation_prompt=True,
             )
             start = len(prefix_ids)
 
             # Tokenize prefix + this assistant message to get end
             prefix_plus = prefix_messages + [msg]
-            prefix_plus_ids = tokenizer.apply_chat_template(
-                prefix_plus, tokenize=True,
-            )
+            prefix_plus_ids = _template_to_ids(tokenizer, prefix_plus)
             end = len(prefix_plus_ids)
 
             boundaries.append((start, end))
@@ -203,9 +211,23 @@ def main():
     logger.info(f"Using {n} examples")
 
     # Load tokenizer and apply chat template
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Some models (e.g. Mistral) ship chat_template.json separately
+    if tokenizer.chat_template is None:
+        from huggingface_hub import hf_hub_download
+        try:
+            ct_path = hf_hub_download(model_name, "chat_template.json")
+            ct_data = json.load(open(ct_path))
+            if isinstance(ct_data, dict) and "chat_template" in ct_data:
+                tokenizer.chat_template = ct_data["chat_template"]
+            elif isinstance(ct_data, str):
+                tokenizer.chat_template = ct_data
+            logger.info("Loaded chat template from chat_template.json")
+        except Exception:
+            logger.warning("No chat template found — apply_chat_template may fail")
 
     templated_prompts = []
     all_boundaries = []
@@ -221,7 +243,7 @@ def main():
         templated_prompts.append(full_str)
 
         # Token IDs for log-likelihood computation
-        full_ids = tokenizer.apply_chat_template(messages, tokenize=True)
+        full_ids = _template_to_ids(tokenizer, messages)
         all_input_ids.append(torch.tensor(full_ids, dtype=torch.long))
 
         # Assistant token boundaries
@@ -265,8 +287,15 @@ def main():
         example_logits = logits_batch[i][mask]  # (seq_len, vocab)
         example_ids = all_input_ids[i]
 
-        # Sanity check: token counts should match
-        if len(example_ids) != seq_len:
+        # Handle BOS duplication: lmprobe's tokenizer may prepend an extra
+        # BOS token when the chat template already includes one. If
+        # extracted is exactly 1 longer and starts with BOS, strip it.
+        if seq_len == len(example_ids) + 1:
+            # Strip the leading duplicate BOS from logits
+            example_logits = example_logits[1:]
+            seq_len -= 1
+            logger.debug(f"Example {i}: stripped duplicate BOS (extracted had +1 token)")
+        elif len(example_ids) != seq_len:
             logger.warning(
                 f"Example {i}: token count mismatch: "
                 f"template={len(example_ids)} vs extracted={seq_len}. "
