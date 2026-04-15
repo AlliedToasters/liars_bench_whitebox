@@ -3,6 +3,8 @@ This is research project attempting to recover the on-policy latents for the lia
 
 ## Liar's Bench Citation
 
+If you use this work, please also cite the [original Liars' Bench paper](https://arxiv.org/pdf/2511.16035):
+
 ```bibtex
 @article{kretschmar2025liarsbench,
   title={Liars' Bench: Evaluating Lie Detectors for Language Models},
