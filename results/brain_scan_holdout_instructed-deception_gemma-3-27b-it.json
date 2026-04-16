@@ -1,0 +1,72 @@
+{
+  "model": "google/gemma-3-27b-it",
+  "dataset": "instructed-deception",
+  "n_train": 400,
+  "n_test": 100,
+  "seed": 42,
+  "signals": [
+    "attn_delta",
+    "mlp_delta"
+  ],
+  "n_components": 64,
+  "n_layers": 62,
+  "evaluation": "holdout_assistant_only",
+  "separability": {
+    "attn_delta": {
+      "top_layers": [
+        45,
+        28,
+        25,
+        29,
+        26,
+        22,
+        48,
+        24,
+        27,
+        61
+      ],
+      "top_aurocs": [
+        0.9808,
+        0.98,
+        0.9752,
+        0.9692,
+        0.9668,
+        0.9664,
+        0.9652000000000001,
+        0.9648,
+        0.9636,
+        0.9552
+      ],
+      "max_auroc": 0.9808,
+      "mean_auroc": 0.896083870967742
+    },
+    "mlp_delta": {
+      "top_layers": [
+        37,
+        29,
+        49,
+        27,
+        26,
+        33,
+        28,
+        30,
+        24,
+        23
+      ],
+      "top_aurocs": [
+        0.9756,
+        0.9736,
+        0.9724,
+        0.9708,
+        0.9708,
+        0.97,
+        0.9692,
+        0.9648,
+        0.9632000000000001,
+        0.96
+      ],
+      "max_auroc": 0.9756,
+      "mean_auroc": 0.8882709677419355
+    }
+  }
+}
