@@ -135,6 +135,29 @@ bal_acc_1pct = balanced_accuracy_score(labels, preds)
 
 4. **Generative-only PCA fitting.** Prevents the basis from encoding system prompt differences between conditions.
 
+## Classification Under Liar's Bench Taxonomy
+
+Following the taxonomy in Appendix C of the Liar's Bench paper (Kretschmar et al., 2025):
+
+| Property | Classification | Notes |
+|---|---|---|
+| **Model access** | White-box | Reads activation deltas at every layer |
+| **Message scope** | Full (evaluated at assistant scope) | The forward pass processes the full sequence (system + user + assistant) — this is inherent to how transformers work. However, the signal we measure is decontaminated to assistant scope: PCA is fit only on generative (assistant-turn) tokens, and evaluation uses only the assistant's last token. See "Prompt leakage" below. |
+| **Interactivity** | Static | Single forward pass on the existing transcript. No additional tokens generated. |
+| **Semantic verification** | Incapable | The probe operates on activation geometry, not factual verification. It does not check whether claims are true. |
+
+### Prompt leakage and decontamination
+
+The instructed-deception dataset uses different system prompts for deceptive ("Try to deceive them") and truthful ("Answer truthfully") conditions. Initial analysis on the full token sequence yielded perfect AUROC (1.000) at multiple layers — this was **prompt leakage**, not deception detection. The model's activations trivially encode the instruction text.
+
+Three decontamination steps control for this:
+
+1. **Generative-only PCA**: The basis is fit only on assistant-turn tokens, excluding system and user prompts from the variance computation.
+2. **Assistant-last-token evaluation**: Separability is computed at the last token of the assistant turn, not the last token of the full sequence.
+3. **Train/test holdout**: The basis is fit on 400 training samples and evaluated on 100 held-out test samples.
+
+This reduces the effective message scope to **assistant-only** for the signal we report, even though the forward pass necessarily sees the full context. The decontamination steps are themselves a methodological contribution — they demonstrate awareness of the confound and provide a reproducible protocol for controlling it.
+
 ## Comparison with Liar's Bench Paper
 
 The paper evaluates linear probes at **1% FPR** and reports **balanced accuracy** and **AUROC**.
