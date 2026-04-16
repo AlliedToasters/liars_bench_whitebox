@@ -61,12 +61,12 @@ To make comparisons to the paper meaningful, we match their protocol as closely 
 | Aspect | Paper's choice | Our choice | Deviation? |
 |---|---|---|---|
 | Target models | 4 open-weight models (list from paper) | Same 4 | No |
-| Probe layer | 20th percentile layer | [fill in] | [yes/no, justify] |
-| Aggregation | Mean of per-token inner products over assistant response, last 5 tokens excluded | [fill in] | [yes/no, justify] |
+| Probe layer | 20th percentile layer | **Best layer (max AUROC over all layers)** | **Yes.** Our unsupervised PCA basis produces a separability curve across all layers. We report the peak. This is methodologically different from a fixed-layer probe: it searches over ~40–80 layers per model. To control for this, we will also report performance at the paper's 20th-percentile layer for direct comparison, and report the oracle advantage (best − 20th pctile) as a separate number. If >50% of our gain comes from layer search, the contribution is "layer matters" not "probe is better." |
+| Aggregation | Mean of per-token inner products over assistant response, last 5 tokens excluded | **Single token: last token of assistant turn** | **Yes.** We use the final assistant token rather than averaging over the response. Justification: the last token has processed the full response via causal attention, so it contains the most information about the model's generation strategy. To control: we will also report mean-over-assistant-tokens (excluding last 5) for direct comparison. If mean aggregation substantially outperforms last-token, our architectural choice is wrong and we should switch. |
 | Threshold | 1% FPR on Alpaca | 1% FPR on Alpaca | No |
 | Metrics | BalAcc, AUROC, Recall, all at 1% FPR threshold | Same | No |
-| System prompt inclusion | Excluded from probe evaluation positions | [fill in] | [yes/no, justify] |
-| Response truncation | Last 5 tokens of assistant response excluded | [fill in] | [yes/no, justify] |
+| System prompt inclusion | Excluded from probe evaluation positions | **Forward pass sees full sequence; PCA fit on generative tokens only; evaluation at assistant last token only** | **Partial deviation.** The model's activations at the assistant last token are causally influenced by the system prompt (via attention). We cannot exclude this influence without modifying the forward pass. Our decontamination (generative-only PCA, assistant-last-token eval) reduces but does not eliminate system-prompt influence. Experiment 3 (counterfactual system-prompt ablation) directly measures the residual leakage. |
+| Response truncation | Last 5 tokens of assistant response excluded | **No truncation (last token used)** | **Yes.** We specifically use the last token, which the paper excludes. The paper's exclusion may be motivated by EOS-token artifacts. To control: we will report performance with last-5-excluded (using the 6th-from-last token) for direct comparison. |
 
 For every deviation marked "yes," run a variant of the experiment matching the paper's choice and report both numbers. This isolates how much of any performance gap comes from the probe itself vs. protocol differences.
 
@@ -215,6 +215,31 @@ For every deviation marked "yes," run a variant of the experiment matching the p
 - Strip the novel components one at a time. Re-run on the full eval.
 - Report AUROC delta per component.
 - The simplest version of the method should be reported as a baseline, so reviewers can see how much complexity actually buys us.
+
+### 5.9 Experiment 9: Contrastive baseline comparison (NOT OPTIONAL)
+
+**Goal:** Determine whether our method's performance comes from the PCA-based probing index specifically, or from the contrastive activation extraction more generally. This is the first thing a reviewer familiar with the literature will ask.
+
+**Baselines:**
+
+1. **Difference-of-means (DoM):** At each layer, compute `d = mean(activations | deceptive) - mean(activations | truthful)` on the ID training set, normalized to unit length. Score test samples as `dot(activation, d)`. This is the simplest possible supervised direction. No PCA involved.
+
+2. **CCS (Contrast-Consistent Search, Burns et al. 2023):** Find directions where contrastive pairs (same prompt, different truthfulness) map to opposite ends. This is unsupervised in a different way than PCA — it uses the structure of contrastive pairs rather than labels directly.
+
+3. **Our method:** PCA basis (unsupervised) + max-AUROC PC selection (supervised). The key question is whether PCA's multi-component decomposition adds value over a single contrastive direction.
+
+**Procedure:**
+1. All three methods trained on LB-ID train split (same data, same activations).
+2. All three evaluated zero-shot on HP-C, HP-KR, IT, GS, CG using the held-out slices.
+3. Report AUROC, BalAcc@1%FPR, and Recall@1%FPR for all three, same table format.
+
+**Decision rules:**
+- If our method > DoM > CCS: PCA decomposition adds value. Lead with the method.
+- If our method ≈ DoM > CCS: PCA decomposition doesn't help; the contribution is "contrastive directions trained on one scenario generalize." Narrower but honest claim.
+- If DoM > our method: Our method is worse than the simplest baseline. Debug before publishing.
+- If CCS > our method: Unsupervised methods outperform our supervised selection. Different paper.
+
+**Compute cost:** Near-zero. DoM and CCS directions can be computed from cached training-set projections. Evaluation uses cached test_vecs. No GPU needed.
 
 ---
 
@@ -396,12 +421,12 @@ The final writeup should be organized so a skeptical reviewer can verify each cl
 
 Fill in before running experiments. These are binding.
 
-- **Layer selection:** Was our probe's layer choice ever tuned on LB, or LB-adjacent data? [yes/no, explain]
-- **Hyperparameter tuning:** Which probe hyperparameters were tuned, and on what data? [list]
-- **Probe variants:** How many variants of the probing index were tried before selecting the current one? On what data was the selection made? [describe]
-- **Held-out LB slice:** Will results be reported on a held-out slice that has never been inspected? [yes/no; if no, justify]
-- **Models finalized:** The 4 target models are: [list exact HF IDs]
-- **Training data finalized:** D_train is: [exact description, version, commit]
+- **Layer selection:** **Yes, tuned on LB.** We computed separability-by-layer plots on all 4 models using LB instructed-deception data. We observed peak layers (Mistral L16, Gemma L45, Llama L32, Qwen L53) and Cohen's d profiles. Our current approach reports best-layer performance, which was motivated by seeing these curves. **Mitigation:** We will report both best-layer and fixed-20th-percentile-layer results. The held-out slice (below) has never been scored at any layer, so layer selection on the development slice does not contaminate the held-out evaluation.
+- **Hyperparameter tuning:** PCA n_components=64 was chosen as a round power-of-two, not tuned. The choice of signals (attn_delta, mlp_delta) was fixed from the start based on lmprobe's available signals. The choice of assistant-last-token (vs. mean-over-tokens) was made after observing that it gave cleaner separability than mean-over-tokens on LB instructed-deception. **This is a disclosure, not a defense** — the token-position choice was informed by LB performance.
+- **Probe variants:** Three variants were tried during development: (1) full-sequence PCA + full-sequence eval (produced perfect AUROC due to prompt leakage), (2) full-sequence PCA + assistant-last-token eval (still leaked via PCA basis), (3) generative-only PCA + assistant-last-token eval (current approach). All three were evaluated on LB instructed-deception data. The progression was driven by diagnosing the leakage, not by fishing for the best number — but the end result is that the current variant was selected based on LB performance.
+- **Held-out LB slice:** **Yes.** We will create a 20% held-out slice of each LB dataset (stratified by label, seed=2026, documented) that has never been scored, plotted, or inspected. Primary results reported on held-out slice. Development-set results reported separately. The development set is everything we have scored to date (the 400-train/100-test splits used in our existing experiments).
+- **Models finalized:** The 4 target models are: `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, `google/gemma-3-27b-it`, `meta-llama/Llama-3.3-70B-Instruct`, `Qwen/Qwen2.5-72B-Instruct`. These are the same models used in Liar's Bench.
+- **Training data finalized:** D_train for the primary evaluation is LB instructed-deception (400 samples, seed=42, generative tokens only). **This is LB data, not external data.** The cross-dataset transfer claim is: a basis fit on LB instructed-deception generalizes to other LB datasets. We are not claiming to have trained on non-LB data. If we later add an external training corpus, it will be documented as an amendment. For the within-LB generalization claim, the leave-one-dataset-out design (Experiment 2) provides the strongest test.
 
 ---
 
@@ -415,6 +440,49 @@ If any of the following occur during execution, stop and consult before continui
 - Experiment 3's V_neutral result shows ΔAUROC > 0.15 on ID or CG — primary claim likely needs scoping, discuss framing before proceeding to paper draft.
 
 ---
+
+## 12. Ambiguous Results Plan
+
+The modal outcome of a rigorous experiment is not "clear win" or "clear loss" — it's "cleared some bars, not others." Pre-deciding how to narrate each scenario reduces temptation to reach for the best-looking framing after the fact.
+
+| Scenario | Narrative | Action |
+|---|---|---|
+| Aggregate clears both bars (BalAcc > 0.73, AUROC > 0.91) and Experiment 3 holds | Framing #1: "Matches or exceeds privileged-access upper bound without privileged access." Lead with the aggregate table. | Write the strong paper. |
+| Aggregate clears AUROC but not BalAcc | "Our probe achieves superior discrimination (AUROC) but the 1% FPR operating point is less favorable. The gap is in threshold calibration, not signal quality." Lead with AUROC, present BalAcc honestly, investigate whether Alpaca threshold calibration is the bottleneck. | Write the paper with AUROC as the primary metric and an honest discussion of the BalAcc shortfall. |
+| Aggregate clears on ID/CG/IT but fails on HP-KR/GS | Framing #3: "On datasets with instructed deception, our probe substantially improves over baselines. On datasets requiring detection of spontaneous or strategically motivated deception, the problem remains open." | Scope the claim. This is still publishable — honest scoping is a contribution. |
+| Experiment 3 shows large system-prompt dependence (ΔAUROC > 0.10) | "Our probe detects instructed deception, including system-prompt influence. It does not isolate assistant-scope deception from instruction-following." | Reframe the paper around what the probe actually detects. Do not claim assistant-scope signal. |
+| One model (e.g. Gemma) dramatically underperforms | Report it prominently. Investigate: is it architecture-specific (distributed signal, low Cohen's d), tokenizer-related, or a pipeline bug? | Include per-model analysis. Do not average away the outlier. |
+| Sanity probes fail (scrambled labels above chance) | Pipeline bug. | **Stop. Debug. Do not write the paper until this is resolved.** |
+
+## 13. Compute Budget
+
+Based on observed runtimes on a single NVIDIA RTX 5090 (32 GB VRAM, 128 GB system RAM):
+
+| Operation | Per-model time | Total (4 models) |
+|---|---|---|
+| Fit basis (400 samples, chunked/24B) | ~5 min | ~10 min (2 models) |
+| Fit basis (400 samples, disk_offload/70B) | ~15 min | ~30 min (2 models) |
+| Batch eval (100 samples, chunked/24B) | ~1 min | ~2 min |
+| Batch eval (100 samples, disk_offload/70B) | ~3 min | ~6 min |
+| Batch eval (100 samples, long sequences/IT) | ~5-10 min | ~10-20 min |
+
+**Experiment cost estimates:**
+- Experiment 1 (headline, 7 datasets × 4 models × 5 seeds): ~20 basis fits + ~140 eval cells. ~8–12 GPU-hours.
+- Experiment 2 (LOO within LB, 7-fold × 4 models): ~28 basis fits + ~28 evals. ~6–8 GPU-hours.
+- Experiment 3 (system-prompt ablation, 3 variants × 2 datasets × 4 models): ~24 eval cells, no new bases. ~2 GPU-hours.
+- Experiments 5–8 (sanity, paraphrase, ablations): ~4–6 GPU-hours.
+- **Total: ~20–30 GPU-hours.** Fits in a weekend with overnight runs.
+
+**Checkpointing:** All results are cached as `test_vecs_*.npz` files. A crash at hour 20 loses at most the current eval cell (~3 min), not hours 1–19. Results are append-only by design.
+
+## 14. Disclosure of Prior Access
+
+This section documents who has seen preliminary results and when.
+
+- **Michael Klear (author):** Has seen all development results (separability plots, AUROC tables, cross-dataset transfer, brain scan heatmaps) on all 4 models across ID, HP-C, HP-KR, IT datasets. Has iterated on the probing approach based on these results.
+- **[fill in other names / "no one else"]:** [describe what they've seen]
+- **Public disclosure:** GitHub Pages results site (alliedtoasters.github.io/liars_bench_whitebox) has been live since [date]. It shows AUROC results, not BalAcc@1%FPR. Anyone with the URL has seen the development results.
+- **Pre-freeze / post-freeze boundary:** All results generated before the freeze commit are development results. All results generated after the freeze commit are pre-registered results. The held-out LB slice has never been scored by anyone.
 
 **End of spec. Freeze and commit before running.**
 

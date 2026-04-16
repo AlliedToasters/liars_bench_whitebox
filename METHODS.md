@@ -26,7 +26,9 @@ Two operations:
 1. **Fit**: Given labeled prompts `(X, Y)`, run a forward pass capturing activation deltas at every `(token, layer)`, fit PCA on the generative tokens to get a reusable basis.
 2. **Evaluate**: Given a fitted basis and new labeled prompts `(X', Y')`, project through the basis and compute classification metrics at the assistant's last token.
 
-The basis is fit **once** on a training corpus and applied to any number of test prompts with no retraining. This is the core claim: a single unsupervised PCA basis transfers across deception scenarios.
+The basis is fit **once** on a training corpus and applied to any number of test prompts with no retraining. This is the core claim: a PCA basis fit on one deception scenario transfers zero-shot to other deception scenarios.
+
+**Terminology note:** PCA fitting is unsupervised (labels are not used). However, the subsequent step of selecting the best PC direction uses labeled data (max AUROC over PCs). The overall method is therefore **unsupervised basis + supervised direction selection** — functionally a label-informed probe, not a purely unsupervised detector. We use "PCA-based probe" rather than "unsupervised probe" to avoid overclaiming.
 
 ## Step 1: Fit a Basis
 
@@ -144,7 +146,7 @@ bal_acc_1pct = balanced_accuracy_score(labels, preds)
 
 ## Key Design Decisions
 
-1. **PCA, not a trained classifier.** The basis is unsupervised — it captures the directions of maximum variance in generative activations. Separability is measured post-hoc. This avoids overfitting a probe to the training distribution.
+1. **PCA basis with post-hoc direction selection.** The PCA basis captures directions of maximum variance in generative activations without using labels. The deception-discriminating direction is then selected post-hoc (the PC with max AUROC). This two-step approach avoids directly fitting a classifier to the training labels, but the direction selection step is label-informed and must be evaluated on held-out data.
 
 2. **Activation deltas, not raw activations.** We capture `attn_delta` (residual change from attention) and `mlp_delta` (residual change from MLP) rather than the full hidden state. These isolate what each sublayer *contributes*, not what it receives.
 
@@ -233,5 +235,5 @@ Their results:
 
 Our approach differs in that:
 - We use internal activations (whitebox), not behavioral features
-- Our basis is unsupervised (PCA) and transfers zero-shot
+- Our PCA basis is fit on one dataset and transfers zero-shot to others
 - We evaluate at the same 1% FPR threshold for direct comparison
