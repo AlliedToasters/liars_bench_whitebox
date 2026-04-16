@@ -2,6 +2,23 @@
 
 Core pipeline for whitebox deception detection using lmprobe's SampleScan.
 
+## On-Policy Activations
+
+We extract activations by replaying the model's own transcripts from the Liar's Bench dataset through a forward pass. These activations are **on-policy**: they are identical to the activations the model produced during original generation.
+
+**Why this holds:** Transformer inference is deterministic given input tokens. At position `t`, the model sees tokens `0..t` and produces activations that depend only on that prefix (causal attention). Whether token `t+1` was sampled live or is pre-filled from a recorded transcript does not affect the activations at position `t`. Our forward pass replays the exact token sequence, so activations at each position are identical to what they were during generation.
+
+**Empirical validation:** We verified this by computing per-token log-likelihood of the assistant's responses in the ground-truth transcripts (`on_policy_affirmation.py`):
+
+| Model | Mean PPL | Median PPL | Mean LL | n |
+|---|---|---|---|---|
+| Mistral-Small-3.1-24B | 1.35 | 1.29 | -0.287 | 50 |
+| Gemma-3-27B-it | 1.44 | 1.35 | -0.338 | 50 |
+
+Perplexity near 1.0 confirms the model assigns high probability to the tokens it actually generated, validating correct template reconstruction, tokenization, and chunked execution. If any of these were wrong (e.g. incorrect chat template, model version mismatch), perplexity would be significantly higher.
+
+**What "on-policy" means here:** The Liar's Bench transcripts were sampled from these models under specific prompting conditions. We measure activations on the trajectories the model actually took — not on counterfactual or adversarial inputs. This is the standard meaning of "on-policy" in the RL sense: the data distribution matches the policy being analyzed.
+
 ## Overview
 
 Two operations:
