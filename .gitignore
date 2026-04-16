@@ -37,9 +37,10 @@ Thumbs.db
 activations/
 outputs/
 
-# Results: track summaries and key figures, ignore HTML interactives and test plots
-results/*.html
+# Results: track summaries and key figures
+# Ignore test/demo artifacts but keep publication-quality interactives
 results/test_*.png
+results/test_*.html
 results/trajectory_demo.*
 
 # Scans (large, regeneratable)
