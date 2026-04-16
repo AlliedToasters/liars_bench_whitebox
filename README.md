@@ -1,5 +1,5 @@
 # Liar's Bench Whitebox Repo
-This is research project attempting to recover the on-policy latents for the liar's bench dataset.
+This is research project attempting to recover the on-policy latents for the liar's bench dataset. [results](https://alliedtoasters.github.io/liars_bench_whitebox/)
 
 ## Datasets
 
