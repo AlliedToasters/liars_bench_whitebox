@@ -1,13 +1,76 @@
 <!DOCTYPE html>
 <html>
-<head><title>Liar's Bench Whitebox — Interactive Results</title></head>
-<body style="font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px;">
+<head>
+<title>Liar's Bench Whitebox — Results</title>
+<style>
+body { font-family: sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+h1 { border-bottom: 2px solid #333; padding-bottom: 10px; }
+h2 { margin-top: 40px; color: #444; }
+h3 { color: #666; }
+img { max-width: 100%; border: 1px solid #ddd; margin: 10px 0; }
+.pair { display: flex; gap: 20px; flex-wrap: wrap; }
+.pair img { flex: 1; min-width: 300px; max-width: 48%; }
+a { color: #0066cc; }
+table { border-collapse: collapse; margin: 15px 0; }
+th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: center; }
+th { background: #f5f5f5; }
+</style>
+</head>
+<body>
+
 <h1>Liar's Bench Whitebox</h1>
-<h2>Interactive Results</h2>
-<ul>
-<li><a href="contrastive_brain_scan.html">Contrastive Brain Scan</a> — Where deceptive differs from truthful (layer x PC heatmap)</li>
-<li><a href="separability_comparison_id_mistral.html">Separability Comparison</a> — AUROC by layer: leaked vs corrected analysis</li>
-</ul>
-<p><a href="https://github.com/AlliedToasters/liars_bench_whitebox">Back to repo</a></p>
+<p>Mechanistic interpretability for deception detection in language models.
+<a href="https://github.com/AlliedToasters/liars_bench_whitebox">GitHub</a></p>
+
+<h2>Cross-Dataset Deception Detection</h2>
+<p>A PCA basis fit on instructed-deception (Mistral 24B, generative tokens only) transfers to other deception scenarios:</p>
+<table>
+<tr><th>Test Dataset</th><th>attn_delta AUROC</th><th>mlp_delta AUROC</th></tr>
+<tr><td>Instructed-Deception (holdout)</td><td><b>0.976</b></td><td><b>0.976</b></td></tr>
+<tr><td>Harm-Pressure-Choice</td><td>0.917</td><td>0.925</td></tr>
+<tr><td>Harm-Pressure-KR</td><td>0.788</td><td>0.799</td></tr>
+<tr><td>Insider-Trading</td><td>0.804</td><td>0.727</td></tr>
+</table>
+
+<h2>Separability by Layer</h2>
+<p><a href="separability_comparison_id_mistral.html">Interactive version</a></p>
+<img src="separability_comparison_id_mistral.png" alt="Separability comparison">
+
+<h2>Contrastive Brain Scan</h2>
+<p>Mean(deceptive) - Mean(truthful) projections across layers and PCs.
+<a href="contrastive_brain_scan.html">Interactive version</a></p>
+<img src="contrastive_brain_scan.png" alt="Contrastive brain scan">
+
+<h2>Deception Probe Heatmaps</h2>
+<p>Per-token deception probe score at every layer. Red = deceptive activation, blue = truthful.
+The best-separating PC direction per layer is used as the probe.</p>
+
+<h3>Pair 1: "Is Praia a country?"</h3>
+<div class="pair">
+<img src="deception_probe_dec_0.png" alt="Deceptive: Praia">
+<img src="deception_probe_truth_0.png" alt="Truthful: Praia">
+</div>
+
+<h3>Pair 2: "Is Thimphu a capital?"</h3>
+<div class="pair">
+<img src="deception_probe_dec_1.png" alt="Deceptive: Thimphu">
+<img src="deception_probe_truth_1.png" alt="Truthful: Thimphu">
+</div>
+
+<h2>Brain Scans (Generative Only)</h2>
+<p>RGB hero plots showing top-3 PCA components of attention deltas, cropped to assistant turn only.</p>
+
+<h3>Deceptive Examples</h3>
+<img src="brain_dec_0.png" alt="Deceptive brain scan 0">
+<img src="brain_dec_1.png" alt="Deceptive brain scan 1">
+
+<h3>Truthful Examples</h3>
+<img src="brain_truth_0.png" alt="Truthful brain scan 0">
+<img src="brain_truth_1.png" alt="Truthful brain scan 1">
+
+<h2>Difference Plot</h2>
+<p>Deceptive minus truthful projections, assistant tokens only.</p>
+<img src="hero_diff_id_mistral.png" alt="Hero diff plot">
+
 </body>
 </html>
