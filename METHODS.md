@@ -152,6 +152,54 @@ bal_acc_1pct = balanced_accuracy_score(labels, preds)
 
 4. **Generative-only PCA fitting.** Prevents the basis from encoding system prompt differences between conditions.
 
+## Computational Approach
+
+A practical barrier to whitebox analysis of frontier-scale models is that they don't fit in GPU memory. We overcome this using lmprobe's chunked execution backends, enabling full activation extraction on a single 32GB GPU.
+
+### Chunked forward pass
+
+For models that fit in CPU RAM (up to ~48B parameters on a 128GB machine):
+
+- The full model is loaded on CPU.
+- Decoder layers are streamed through the GPU in chunks (e.g. 18 layers at a time).
+- Between chunks, PCA is fit on the captured activation deltas while the GPU is idle.
+- Hidden states are passed between chunks via CPU memory.
+
+This means GPU memory scales with **chunk size**, not model size. A 24B model runs in the same GPU memory as a 7B model — just in more chunks.
+
+### Disk offload forward pass
+
+For models exceeding CPU RAM (70B+):
+
+- Layer weights are loaded directly from safetensors files to GPU **one layer at a time**.
+- After each layer, activation deltas are captured and the weights are discarded.
+- Peak memory is a single layer's weights + hidden states + captures.
+
+This enables running 70B models on a machine with 128GB RAM and a single 32GB GPU — the full model is never materialized in memory.
+
+### Batch projection
+
+Evaluating a pre-fit basis on new samples uses `batch_project`:
+
+- All test samples are processed in a single forward pass (per layer chunk/layer), projecting activations onto the stored PCA basis as they're computed.
+- This replaces the naive approach of N separate forward passes (one per sample).
+- For 100 test samples on a 70B model: ~3 minutes vs ~5 hours.
+
+### Between-chunk PCA
+
+PCA is fit incrementally between layer chunks rather than after the full forward pass. This means:
+
+- Activation captures for a chunk are projected and discarded before the next chunk loads.
+- Memory for raw activations scales with **chunk size x samples x tokens**, not **all layers x samples x tokens**.
+- The basis for each layer is available immediately after its chunk completes.
+
+### Hardware requirements
+
+| Model size | Backend | GPU VRAM | CPU RAM | Time (500 samples) |
+|---|---|---|---|---|
+| 24-27B | Chunked | 32 GB | 64 GB | ~5 min |
+| 70-72B | Disk offload | 32 GB | 128 GB | ~15 min |
+
 ## Classification Under Liar's Bench Taxonomy
 
 Following the taxonomy in Appendix C of the Liar's Bench paper (Kretschmar et al., 2025):
