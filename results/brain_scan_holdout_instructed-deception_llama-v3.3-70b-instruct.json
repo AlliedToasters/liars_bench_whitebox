@@ -1,0 +1,72 @@
+{
+  "model": "meta-llama/Llama-3.3-70B-Instruct",
+  "dataset": "instructed-deception",
+  "n_train": 400,
+  "n_test": 100,
+  "seed": 42,
+  "signals": [
+    "attn_delta",
+    "mlp_delta"
+  ],
+  "n_components": 64,
+  "n_layers": 80,
+  "evaluation": "holdout_assistant_only",
+  "separability": {
+    "attn_delta": {
+      "top_layers": [
+        32,
+        30,
+        37,
+        46,
+        78,
+        42,
+        19,
+        47,
+        35,
+        28
+      ],
+      "top_aurocs": [
+        0.9556,
+        0.9526,
+        0.9496,
+        0.9308,
+        0.9292,
+        0.9288,
+        0.9248000000000001,
+        0.9232,
+        0.9204,
+        0.9168000000000001
+      ],
+      "max_auroc": 0.9556,
+      "mean_auroc": 0.8493850000000002
+    },
+    "mlp_delta": {
+      "top_layers": [
+        27,
+        28,
+        22,
+        19,
+        21,
+        24,
+        25,
+        23,
+        20,
+        38
+      ],
+      "top_aurocs": [
+        0.9460000000000001,
+        0.9444,
+        0.9424,
+        0.9056,
+        0.8812,
+        0.8792,
+        0.8782000000000001,
+        0.8744,
+        0.872,
+        0.8652
+      ],
+      "max_auroc": 0.9460000000000001,
+      "mean_auroc": 0.8118224999999999
+    }
+  }
+}

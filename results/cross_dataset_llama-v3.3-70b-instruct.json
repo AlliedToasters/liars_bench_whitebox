@@ -1,0 +1,14 @@
+{
+  "harm-pressure-choice": {
+    "attn_max": 0.68,
+    "mlp_max": 0.683
+  },
+  "harm-pressure-knowledge-report": {
+    "attn_max": 0.8968,
+    "mlp_max": 0.8644000000000001
+  },
+  "insider-trading": {
+    "attn_max": 0.854,
+    "mlp_max": 0.8988
+  }
+}

@@ -22,14 +22,29 @@ th { background: #f5f5f5; }
 <p>Mechanistic interpretability for deception detection in language models.
 <a href="https://github.com/AlliedToasters/liars_bench_whitebox">GitHub</a></p>
 
-<h2>Cross-Dataset Deception Detection (Mistral)</h2>
-<p>A PCA basis fit on instructed-deception (Mistral 24B, generative tokens only) transfers to other deception scenarios:</p>
+<h2>Within-Dataset Holdout Results</h2>
+<p>PCA basis fit on 400 training samples (generative tokens only), evaluated on 100 held-out test samples (assistant last-token only).</p>
 <table>
-<tr><th>Test Dataset</th><th>attn_delta AUROC</th><th>mlp_delta AUROC</th></tr>
-<tr><td>Instructed-Deception (holdout)</td><td><b>0.976</b></td><td><b>0.976</b></td></tr>
-<tr><td>Harm-Pressure-Choice</td><td>0.917</td><td>0.925</td></tr>
-<tr><td>Harm-Pressure-KR</td><td>0.788</td><td>0.799</td></tr>
-<tr><td>Insider-Trading</td><td>0.804</td><td>0.727</td></tr>
+<tr><th>Model</th><th>Signal</th><th>Best Layer</th><th>Max AUROC</th><th>Mean AUROC</th></tr>
+<tr><td rowspan="2">Mistral 24B</td><td>attn_delta</td><td>16</td><td><b>0.976</b></td><td>0.814</td></tr>
+<tr><td>mlp_delta</td><td>16</td><td><b>0.976</b></td><td>0.852</td></tr>
+<tr><td rowspan="2">Gemma 27B</td><td>attn_delta</td><td>45</td><td><b>0.981</b></td><td>0.896</td></tr>
+<tr><td>mlp_delta</td><td>37</td><td><b>0.976</b></td><td>0.888</td></tr>
+<tr><td rowspan="2">Llama 70B</td><td>attn_delta</td><td>32</td><td><b>0.956</b></td><td>0.849</td></tr>
+<tr><td>mlp_delta</td><td>27</td><td><b>0.946</b></td><td>0.812</td></tr>
+<tr><td rowspan="2">Qwen 72B</td><td>attn_delta</td><td>53</td><td><b>0.942</b></td><td>0.788</td></tr>
+<tr><td>mlp_delta</td><td>52</td><td><b>0.903</b></td><td>0.776</td></tr>
+</table>
+
+<h2>Cross-Dataset Deception Detection</h2>
+<p>PCA basis fit on instructed-deception (generative tokens only) transfers to other deception scenarios with no retraining.
+Each cell shows attn / mlp AUROC. &mdash; = dataset not available for that model.</p>
+<table>
+<tr><th>Test Dataset</th><th>Mistral 24B</th><th>Gemma 27B</th><th>Llama 70B</th><th>Qwen 72B</th></tr>
+<tr><td>Instructed-Deception (holdout)</td><td><b>0.976</b> / <b>0.976</b></td><td><b>0.981</b> / <b>0.976</b></td><td><b>0.956</b> / <b>0.946</b></td><td>0.942 / 0.903</td></tr>
+<tr><td>Harm-Pressure-Choice</td><td>0.917 / 0.925</td><td>&mdash;</td><td>0.680 / 0.683</td><td><b>0.927</b> / 0.920</td></tr>
+<tr><td>Harm-Pressure-KR</td><td>0.788 / 0.799</td><td>&mdash;</td><td><b>0.897</b> / 0.864</td><td>0.910 / 0.864</td></tr>
+<tr><td>Insider-Trading</td><td>0.804 / 0.727</td><td><b>0.899</b> / <b>0.924</b></td><td>0.854 / <b>0.899</b></td><td>&mdash;</td></tr>
 </table>
 
 <h2>Cross-Architecture Comparison</h2>
@@ -37,9 +52,12 @@ th { background: #f5f5f5; }
 <tr><th>Model</th><th>Layers</th><th>attn max AUROC</th><th>mlp max AUROC</th><th>Peak layer</th><th>Relative depth</th><th>Peak Cohen's d</th></tr>
 <tr><td>Mistral 24B</td><td>40</td><td>0.976</td><td>0.976</td><td>16</td><td>40%</td><td><b>2.61</b></td></tr>
 <tr><td>Gemma 27B</td><td>62</td><td>0.981</td><td>0.976</td><td>45</td><td>73%</td><td>0.88</td></tr>
+<tr><td>Llama 70B</td><td>80</td><td>0.956</td><td>0.946</td><td>32</td><td>40%</td><td>2.11</td></tr>
+<tr><td>Qwen 72B</td><td>80</td><td>0.942</td><td>0.903</td><td>53</td><td>66%</td><td>2.22</td></tr>
 </table>
-<p>Both models detect deception with near-identical AUROC, but the signal's spatial profile differs:
-Mistral concentrates it sharply at layer 16 (d=2.61), Gemma distributes it across the full network (d=0.88 peak, most layers d>0.5).</p>
+<p>All four models detect deception with high AUROC (&gt;0.90). The signal's spatial profile varies:
+Mistral concentrates it sharply at layer 16 (d=2.61, 40% depth), Llama similarly at layer 27 (d=2.11, 40%),
+Qwen peaks later at layer 53 (d=2.22, 66%), while Gemma distributes it broadly (d=0.88, most layers d&gt;0.5).</p>
 
 <h2>Effect Size by Layer</h2>
 
@@ -55,45 +73,171 @@ Mistral concentrates it sharply at layer 16 (d=2.61), Gemma distributes it acros
 <img src="cohens_d_gemma.png" alt="Gemma Cohen's d">
 <img src="population_probe_gemma.png" alt="Gemma population">
 
-<h2>Separability by Layer (Mistral)</h2>
-<p><a href="separability_comparison_id_mistral.html">Interactive version</a></p>
-<img src="separability_comparison_id_mistral.png" alt="Separability comparison">
+<h3>Llama 70B</h3>
+<p><a href="cohens_d_llama-3.3-70b.html">Interactive</a> |
+<a href="population_probe_llama-3.3-70b.html">Population view</a></p>
+<img src="cohens_d_llama-3.3-70b.png" alt="Llama Cohen's d">
+<img src="population_probe_llama-3.3-70b.png" alt="Llama population">
 
-<h2>Contrastive Brain Scan (Mistral)</h2>
-<p>Mean(deceptive) - Mean(truthful) projections across layers and PCs.
-<a href="contrastive_brain_scan.html">Interactive version</a></p>
-<img src="contrastive_brain_scan.png" alt="Contrastive brain scan">
+<h3>Qwen 72B</h3>
+<p><a href="cohens_d_qwen-2.5-72b.html">Interactive</a> |
+<a href="population_probe_qwen-2.5-72b.html">Population view</a></p>
+<img src="cohens_d_qwen-2.5-72b.png" alt="Qwen Cohen's d">
+<img src="population_probe_qwen-2.5-72b.png" alt="Qwen population">
+
+<h2>Separability by Layer</h2>
+
+<h3>Mistral 24B</h3>
+<p><a href="separability_comparison_id_mistral.html">Interactive version</a></p>
+<img src="separability_comparison_id_mistral.png" alt="Mistral separability comparison">
+
+<h3>Gemma 27B</h3>
+<p><a href="separability_comparison_id_gemma.html">Interactive version</a></p>
+<img src="separability_comparison_id_gemma.png" alt="Gemma separability comparison">
+
+<h3>Llama 70B</h3>
+<p><a href="separability_llama-3.3-70b.html">Interactive version</a></p>
+<img src="separability_llama-3.3-70b.png" alt="Llama separability comparison">
+
+<h3>Qwen 72B</h3>
+<p><a href="separability_qwen-2.5-72b.html">Interactive version</a></p>
+<img src="separability_qwen-2.5-72b.png" alt="Qwen separability comparison">
+
+<h2>Contrastive Brain Scan</h2>
+<p>Mean(deceptive) &minus; Mean(truthful) projections across layers and PCs.</p>
+
+<h3>Mistral 24B</h3>
+<p><a href="contrastive_brain_scan.html">Interactive version</a></p>
+<img src="contrastive_brain_scan.png" alt="Mistral contrastive brain scan">
+
+<h3>Gemma 27B</h3>
+<p><a href="contrastive_brain_scan_gemma.html">Interactive version</a></p>
+<img src="contrastive_brain_scan_gemma.png" alt="Gemma contrastive brain scan">
+
+<h3>Llama 70B</h3>
+<p><a href="contrastive_llama-3.3-70b.html">Interactive version</a></p>
+<img src="contrastive_llama-3.3-70b.png" alt="Llama contrastive brain scan">
+
+<h3>Qwen 72B</h3>
+<p><a href="contrastive_qwen-2.5-72b.html">Interactive version</a></p>
+<img src="contrastive_qwen-2.5-72b.png" alt="Qwen contrastive brain scan">
 
 <h2>Deception Probe Heatmaps</h2>
 <p>Per-token deception probe score at every layer. Red = deceptive activation, blue = truthful.
 The best-separating PC direction per layer is used as the probe.</p>
 
-<h3>Pair 1: "Is Praia a country?"</h3>
+<h3>Mistral 24B</h3>
+
+<h4>Pair 1: "Is Praia a country?"</h4>
 <div class="pair">
 <img src="deception_probe_dec_0.png" alt="Deceptive: Praia">
 <img src="deception_probe_truth_0.png" alt="Truthful: Praia">
 </div>
 
-<h3>Pair 2: "Is Thimphu a capital?"</h3>
+<h4>Pair 2: "Is Thimphu a capital?"</h4>
 <div class="pair">
 <img src="deception_probe_dec_1.png" alt="Deceptive: Thimphu">
 <img src="deception_probe_truth_1.png" alt="Truthful: Thimphu">
 </div>
 
+<h3>Gemma 27B</h3>
+
+<h4>Deceptive vs Truthful Example 1</h4>
+<div class="pair">
+<img src="deception_probe_dec_gemma_0.png" alt="Gemma Deceptive 1">
+<img src="deception_probe_truth_gemma_0.png" alt="Gemma Truthful 1">
+</div>
+
+<h4>Deceptive vs Truthful Example 2</h4>
+<div class="pair">
+<img src="deception_probe_dec_gemma_1.png" alt="Gemma Deceptive 2">
+<img src="deception_probe_truth_gemma_1.png" alt="Gemma Truthful 2">
+</div>
+
+<h3>Llama 70B</h3>
+
+<h4>Deceptive vs Truthful Example 1</h4>
+<div class="pair">
+<img src="probe_dec_llama-3.3-70b_0.png" alt="Llama Deceptive 1">
+<img src="probe_truth_llama-3.3-70b_0.png" alt="Llama Truthful 1">
+</div>
+
+<h4>Deceptive vs Truthful Example 2</h4>
+<div class="pair">
+<img src="probe_dec_llama-3.3-70b_1.png" alt="Llama Deceptive 2">
+<img src="probe_truth_llama-3.3-70b_1.png" alt="Llama Truthful 2">
+</div>
+
+<h3>Qwen 72B</h3>
+
+<h4>Deceptive vs Truthful Example 1</h4>
+<div class="pair">
+<img src="probe_dec_qwen-2.5-72b_0.png" alt="Qwen Deceptive 1">
+<img src="probe_truth_qwen-2.5-72b_0.png" alt="Qwen Truthful 1">
+</div>
+
+<h4>Deceptive vs Truthful Example 2</h4>
+<div class="pair">
+<img src="probe_dec_qwen-2.5-72b_1.png" alt="Qwen Deceptive 2">
+<img src="probe_truth_qwen-2.5-72b_1.png" alt="Qwen Truthful 2">
+</div>
+
 <h2>Brain Scans (Generative Only)</h2>
 <p>RGB hero plots showing top-3 PCA components of attention deltas, cropped to assistant turn only.</p>
 
-<h3>Deceptive Examples</h3>
-<img src="brain_dec_0.png" alt="Deceptive brain scan 0">
-<img src="brain_dec_1.png" alt="Deceptive brain scan 1">
+<h3>Mistral 24B</h3>
+<h4>Deceptive Examples</h4>
+<img src="brain_dec_0.png" alt="Mistral Deceptive brain scan 0">
+<img src="brain_dec_1.png" alt="Mistral Deceptive brain scan 1">
 
-<h3>Truthful Examples</h3>
-<img src="brain_truth_0.png" alt="Truthful brain scan 0">
-<img src="brain_truth_1.png" alt="Truthful brain scan 1">
+<h4>Truthful Examples</h4>
+<img src="brain_truth_0.png" alt="Mistral Truthful brain scan 0">
+<img src="brain_truth_1.png" alt="Mistral Truthful brain scan 1">
+
+<h3>Gemma 27B</h3>
+<h4>Deceptive Examples</h4>
+<img src="brain_dec_gemma_0.png" alt="Gemma Deceptive brain scan 0">
+<img src="brain_dec_gemma_1.png" alt="Gemma Deceptive brain scan 1">
+
+<h4>Truthful Examples</h4>
+<img src="brain_truth_gemma_0.png" alt="Gemma Truthful brain scan 0">
+<img src="brain_truth_gemma_1.png" alt="Gemma Truthful brain scan 1">
+
+<h3>Llama 70B</h3>
+<h4>Deceptive Examples</h4>
+<img src="brain_dec_llama-3.3-70b_0.png" alt="Llama Deceptive brain scan 0">
+<img src="brain_dec_llama-3.3-70b_1.png" alt="Llama Deceptive brain scan 1">
+
+<h4>Truthful Examples</h4>
+<img src="brain_truth_llama-3.3-70b_0.png" alt="Llama Truthful brain scan 0">
+<img src="brain_truth_llama-3.3-70b_1.png" alt="Llama Truthful brain scan 1">
+
+<h3>Qwen 72B</h3>
+<h4>Deceptive Examples</h4>
+<img src="brain_dec_qwen-2.5-72b_0.png" alt="Qwen Deceptive brain scan 0">
+<img src="brain_dec_qwen-2.5-72b_1.png" alt="Qwen Deceptive brain scan 1">
+
+<h4>Truthful Examples</h4>
+<img src="brain_truth_qwen-2.5-72b_0.png" alt="Qwen Truthful brain scan 0">
+<img src="brain_truth_qwen-2.5-72b_1.png" alt="Qwen Truthful brain scan 1">
 
 <h2>Difference Plot</h2>
-<p>Deceptive minus truthful projections, assistant tokens only.</p>
-<img src="hero_diff_id_mistral.png" alt="Hero diff plot">
+<p>Deceptive minus truthful projections.</p>
+
+<h3>Mistral 24B</h3>
+<img src="hero_diff_id_mistral.png" alt="Mistral hero diff plot">
+
+<h3>Gemma 27B</h3>
+<p><a href="hero_diff_gemma.html">Interactive version</a></p>
+<img src="hero_diff_gemma.png" alt="Gemma hero diff plot">
+
+<h3>Llama 70B</h3>
+<p><a href="diff_llama-3.3-70b.html">Interactive version</a></p>
+<img src="diff_llama-3.3-70b.png" alt="Llama hero diff plot">
+
+<h3>Qwen 72B</h3>
+<p><a href="diff_qwen-2.5-72b.html">Interactive version</a></p>
+<img src="diff_qwen-2.5-72b.png" alt="Qwen hero diff plot">
 
 </body>
 </html>

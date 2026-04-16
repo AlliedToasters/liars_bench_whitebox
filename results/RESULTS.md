@@ -50,6 +50,34 @@ Layer 16 (40% depth) is the peak for both signals. The MLP signal is broader, wi
 | Assistant-only eval | 0.999 | 0.996 | Still using leaked PCA basis |
 | **Holdout + generative PCA** | **0.976** | **0.976** | Fully decontaminated |
 
+## Brain Scan: Instructed-Deception (Gemma)
+
+### Setup
+
+- **Model**: Gemma-3-27B-it
+- **Dataset**: Instructed-Deception (Liar's Bench)
+- **Method**: SampleScan with generative-only PCA + holdout evaluation (same as Mistral)
+- **Signals**: `attn_delta`, `mlp_delta`
+- **PCA components**: 64
+
+### Within-Dataset Holdout Results
+
+PCA basis fit on 400 training samples (generative tokens only), evaluated on 100 held-out test samples (assistant last-token only).
+
+| Signal | Best Layer | Max AUROC | Mean AUROC |
+|---|---|---|---|
+| attn_delta | 45 | **0.981** | 0.896 |
+| mlp_delta | 37 | **0.976** | 0.888 |
+
+### Cross-Architecture Comparison
+
+| Model | Layers | attn max AUROC | mlp max AUROC | Peak attn layer | Relative depth | Peak Cohen's d |
+|---|---|---|---|---|---|---|
+| Mistral 24B | 40 | 0.976 | 0.976 | 16 | 40% | **2.61** |
+| Gemma 27B | 62 | 0.981 | 0.976 | 45 | 73% | 0.88 |
+
+Both models detect deception with near-identical AUROC, but the signal's spatial profile differs: Mistral concentrates it sharply at layer 16 (d=2.61), Gemma distributes it across the full network (d=0.88 peak, most layers d>0.5). Gemma's mean AUROC is notably higher (0.896 vs 0.814 for attn), reflecting this broader distribution.
+
 ## Cross-Dataset Generalization
 
 ### Setup

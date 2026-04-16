@@ -1,0 +1,72 @@
+{
+  "model": "Qwen/Qwen2.5-72B-Instruct",
+  "dataset": "instructed-deception",
+  "n_train": 400,
+  "n_test": 100,
+  "seed": 42,
+  "signals": [
+    "attn_delta",
+    "mlp_delta"
+  ],
+  "n_components": 64,
+  "n_layers": 80,
+  "evaluation": "holdout_assistant_only",
+  "separability": {
+    "attn_delta": {
+      "top_layers": [
+        53,
+        56,
+        60,
+        37,
+        52,
+        50,
+        77,
+        55,
+        68,
+        42
+      ],
+      "top_aurocs": [
+        0.9416,
+        0.9408,
+        0.9192,
+        0.8898,
+        0.8882,
+        0.8848,
+        0.8795999999999999,
+        0.8746,
+        0.8744,
+        0.8735999999999999
+      ],
+      "max_auroc": 0.9416,
+      "mean_auroc": 0.7877824999999999
+    },
+    "mlp_delta": {
+      "top_layers": [
+        52,
+        58,
+        60,
+        78,
+        72,
+        39,
+        53,
+        34,
+        31,
+        48
+      ],
+      "top_aurocs": [
+        0.903,
+        0.8815999999999999,
+        0.8706,
+        0.8694,
+        0.8680000000000001,
+        0.8636,
+        0.8627999999999999,
+        0.857,
+        0.848,
+        0.8444
+      ],
+      "max_auroc": 0.903,
+      "mean_auroc": 0.7757125
+    }
+  }
+}
