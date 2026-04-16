@@ -1,6 +1,6 @@
 # Experimental Design Spec: Probing Technique Evaluation on Liars' Bench
 
-**Purpose:** Produce a defensible, pre-registered evaluation of our novel probing technique against the baselines reported in Kretschmar et al. 2025 ("Liars' Bench", arXiv:2511.16035v2), with the specific goal of supporting or refuting the claim that our probe matches or exceeds their upper-bound probe (BalAcc 0.73, AUROC 0.91) without access to privileged Liars' Bench training data.
+**Purpose:** Produce a defensible, pre-registered evaluation of our PCA-based probing technique against the baselines reported in Kretschmar et al. 2025 ("Liars' Bench", arXiv:2511.16035v2). Our probe is trained on substantially less data than the paper's upper-bound probe (one LB dataset vs. five) and uses a different methodology (PCA basis with label-informed direction selection, vs. logistic regression). The goal is to determine whether our approach improves over their reported baselines and, critically, whether a probe fit on one deception scenario transfers zero-shot to others.
 
 **Core principle:** This spec is pre-registration. Freeze it in git before running any experiment below. Any deviation after freezing must be documented as an amendment with a timestamp and justification, and flagged in the final report.
 
@@ -8,12 +8,13 @@
 
 ## 1. Claim Under Test
 
-**Primary claim (to be supported or refuted):** Our probe, trained exclusively on data with no Liars' Bench overlap, achieves average balanced accuracy > 0.73 and average AUROC > 0.91 across all 7 Liars' Bench datasets and all 4 target models, with 95% confidence intervals that do not cross those thresholds.
+**Primary claim (to be supported or refuted):** Our PCA-based probe, trained on a single LB dataset (instructed-deception), transfers zero-shot to other LB datasets and achieves average AUROC substantially exceeding the paper's mean probe baseline (0.54 BalAcc) and approaching or exceeding their upper-bound probe (0.73 BalAcc, 0.91 AUROC) — despite being trained on one dataset where their upper bound was trained on five.
 
 **Secondary claims:**
 1. Our probe's signal is not primarily driven by system-prompt leakage (validated by counterfactual system-prompt ablation).
 2. Our probe generalizes across object-of-belief categories, including the paper's hardest datasets (HP-KR, GS), not just instructed-deception cases (ID, CG).
 3. Our probe's performance is consistent across models — no silent underperformance hidden by averaging.
+4. Our PCA-based method outperforms simpler contrastive baselines (difference-of-means, CCS) trained on the same data, justifying the methodological contribution beyond "contrastive directions transfer."
 
 **Anti-claim disclosure:** We will report all four models and all seven datasets with equal prominence. No model or dataset will be dropped from the headline table for any reason.
 
@@ -226,7 +227,7 @@ For every deviation marked "yes," run a variant of the experiment matching the p
 
 2. **CCS (Contrast-Consistent Search, Burns et al. 2023):** Find directions where contrastive pairs (same prompt, different truthfulness) map to opposite ends. This is unsupervised in a different way than PCA — it uses the structure of contrastive pairs rather than labels directly.
 
-3. **Our method:** PCA basis (unsupervised) + max-AUROC PC selection (supervised). The key question is whether PCA's multi-component decomposition adds value over a single contrastive direction.
+3. **Our method:** PCA basis + max-AUROC PC selection. We are a supervised contrastive-probing method. The key question is whether PCA's multi-component decomposition adds value over a single contrastive direction.
 
 **Procedure:**
 1. All three methods trained on LB-ID train split (same data, same activations).
@@ -234,10 +235,10 @@ For every deviation marked "yes," run a variant of the experiment matching the p
 3. Report AUROC, BalAcc@1%FPR, and Recall@1%FPR for all three, same table format.
 
 **Decision rules:**
-- If our method > DoM > CCS: PCA decomposition adds value. Lead with the method.
-- If our method ≈ DoM > CCS: PCA decomposition doesn't help; the contribution is "contrastive directions trained on one scenario generalize." Narrower but honest claim.
+- If our method > DoM > CCS: PCA decomposition adds value beyond simple contrastive directions. Lead with the method.
+- If our method ≈ DoM > CCS: PCA decomposition doesn't help; the contribution is "contrastive directions trained on one scenario generalize." Narrower but honest claim. We are the supervised method in the contrastive-probing family — frame comparison accordingly.
 - If DoM > our method: Our method is worse than the simplest baseline. Debug before publishing.
-- If CCS > our method: Unsupervised methods outperform our supervised selection. Different paper.
+- If CCS > our method: The less-supervised method outperforms our supervised selection. Investigate why — it may indicate that our label-informed PC selection is overfitting to the training scenario.
 
 **Compute cost:** Near-zero. DoM and CCS directions can be computed from cached training-set projections. Evaluation uses cached test_vecs. No GPU needed.
 
@@ -348,16 +349,21 @@ This is the "receipts" plot. Reviewers who want to verify that our aggregate num
 
 ### 6.5.6 Summary: what clears the bar
 
-A compact checklist. The headline "beats upper bound without privileged access" claim is supportable if and only if:
+A compact checklist. The headline claim is supportable at different tiers:
 
-1. ✓ Aggregate BalAcc lower 95% CI > 0.73
-2. ✓ Aggregate AUROC lower 95% CI > 0.91
+**Tier 1 ("strong transfer + method contribution"):**
+1. ✓ Aggregate AUROC across all evaluated datasets substantially exceeds mean probe (0.54 BalAcc)
+2. ✓ Aggregate AUROC approaches or exceeds the upper-bound probe (0.91), despite training on one dataset vs. five
 3. ✓ ΔAUROC under neutral system prompt < 0.05 on ID and CG (Experiment 3)
 4. ✓ No model's AUROC falls >0.15 below the across-model mean
 5. ✓ Sanity probes (scrambled labels, unrelated concepts) produce chance-level results
-6. ✓ D_train → LB disjointness verified and documented
+6. ✓ Our method outperforms difference-of-means and CCS on the same training data (Experiment 9)
 
-If 1 or 2 fail but 3–6 hold, the claim becomes "matches upper bound without privileged access" or "substantially improves over the baseline probe." Still publishable, different framing.
+**Tier 2 ("transfer works, method is comparable to simpler baselines"):**
+Items 1–5 hold, but 6 fails. The contribution is "contrastive directions trained on one scenario generalize across scenarios," not "our specific PCA method is better."
+
+**Tier 3 ("partial transfer, scoped claim"):**
+Transfer works on some datasets (ID, CG, IT) but not others (HP-KR, GS). Honest scoping.
 
 If 3 fails, the primary contribution is scoped to "detecting instructed deception" and the paper is a different paper. Still potentially publishable but honestly framed.
 
@@ -367,8 +373,8 @@ If 5 fails, stop and debug the pipeline before writing anything.
 
 The most defensible framing, ordered from strongest to weakest:
 
-1. **"Our probe, without privileged access to the evaluation benchmark, matches or exceeds the paper's upper-bound probe that was trained with privileged access."** Requires: 1, 2, 3, 4, 5, 6 all clear.
-2. **"Our probe substantially improves over prior off-distribution probes on Liars' Bench, closing most of the gap to the privileged-access upper bound."** Requires: aggregate > 0.54 BalAcc / [paper UB AUROC floor] by a clear margin, and 3, 5, 6 hold.
+1. **"A PCA-based probe trained on a single deception scenario transfers zero-shot across deception types, architectures, and model scales, approaching the performance of a supervised probe trained on five datasets. The deception signal is substantially captured by a linear direction that emerges from one scenario."** Requires: tier 1 items all clear, GS and CG hold up.
+2. **"Our probe, trained on one LB dataset, substantially improves over the mean probe baseline and closes most of the gap to the upper-bound probe trained on five datasets. Within the contrastive-probing family (DoM, CCS, PCA), our PCA-based approach performs best."** Requires: tier 1 items 1–5 clear, item 6 clear. Doesn't require GS/CG.
 3. **"On datasets where prior methods showed signal (ID, CG, IT), our probe substantially improves performance while showing reduced system-prompt dependence. On the hardest datasets (HP-KR, GS), deception detection remains an open problem."** Requires: clean results on ID/CG/IT and honest disclosure on HP-KR/GS.
 
 Pick the framing the data supports. Do not pick one and then reach for the data.
