@@ -1,0 +1,71 @@
+{
+  "model": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+  "dataset": "instructed-deception",
+  "n_samples": 500,
+  "n_per_class": 250,
+  "signals": [
+    "attn_delta",
+    "mlp_delta"
+  ],
+  "n_components": 64,
+  "n_layers": 40,
+  "scan_dir": "/home/alliedtoasters/projects/mech_interp/liars_bench_whitebox/scans/instructed-deception_mistral-small-3.1-24b-instruct",
+  "separability": {
+    "attn_delta": {
+      "top_layers": [
+        14,
+        12,
+        19,
+        16,
+        17,
+        32,
+        15,
+        22,
+        30,
+        13
+      ],
+      "top_aurocs": [
+        1.0,
+        1.0,
+        1.0,
+        0.999856,
+        0.998176,
+        0.996208,
+        0.994672,
+        0.994272,
+        0.990688,
+        0.990216
+      ],
+      "mean_auroc": 0.9458442000000001,
+      "max_auroc": 1.0
+    },
+    "mlp_delta": {
+      "top_layers": [
+        15,
+        20,
+        17,
+        21,
+        16,
+        14,
+        13,
+        12,
+        18,
+        22
+      ],
+      "top_aurocs": [
+        0.999984,
+        0.99992,
+        0.9965919999999999,
+        0.9948,
+        0.9924879999999999,
+        0.991296,
+        0.98632,
+        0.98268,
+        0.979192,
+        0.978528
+      ],
+      "mean_auroc": 0.9423649999999999,
+      "max_auroc": 0.999984
+    }
+  }
+}

@@ -29,6 +29,7 @@ from datasets import load_from_disk
 from transformers import AutoTokenizer
 
 from lmprobe.backends import resolve_backend
+from trajectory_cache import compute_trajectory, save_trajectories
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,42 +53,53 @@ def _template_to_ids(tokenizer, messages, **kwargs) -> list[int]:
     return out
 
 
-def get_assistant_turn_boundaries(
+def get_turn_boundaries(
     messages: list[dict],
     tokenizer: AutoTokenizer,
-) -> list[tuple[int, int]]:
-    """Find token-level (start, end) for each assistant turn.
+) -> list[dict]:
+    """Find token-level boundaries for every turn in the conversation.
 
-    Uses the chat template to identify where assistant content begins
+    Uses the chat template to identify where each message's content begins
     and ends by tokenizing progressively longer prefixes.
 
-    Returns a list of (start, end) index pairs into the full token sequence.
+    Returns a list of dicts with keys: role, start, end.
     """
-    boundaries = []
+    turns = []
 
-    # Build the full token sequence
-    full_ids = _template_to_ids(tokenizer, messages)
-
-    # Walk through messages, accumulating non-assistant turns as prefix
+    # Walk through messages, accumulating as prefix
     prefix_messages = []
-    for i, msg in enumerate(messages):
-        if msg["role"] == "assistant":
-            # Tokenize prefix with generation prompt to get start of assistant
+    for msg in messages:
+        if not prefix_messages:
+            # First message — starts at token 0
+            start = 0
+        elif msg["role"] == "assistant":
+            # For assistant, use add_generation_prompt to find the start
             prefix_ids = _template_to_ids(
                 tokenizer, prefix_messages, add_generation_prompt=True,
             )
             start = len(prefix_ids)
+        else:
+            # For system/user, the start is right after the previous prefix
+            prefix_ids = _template_to_ids(tokenizer, prefix_messages)
+            start = len(prefix_ids)
 
-            # Tokenize prefix + this assistant message to get end
-            prefix_plus = prefix_messages + [msg]
-            prefix_plus_ids = _template_to_ids(tokenizer, prefix_plus)
-            end = len(prefix_plus_ids)
+        prefix_plus = prefix_messages + [msg]
+        prefix_plus_ids = _template_to_ids(tokenizer, prefix_plus)
+        end = len(prefix_plus_ids)
 
-            boundaries.append((start, end))
-
+        turns.append({"role": msg["role"], "start": start, "end": end})
         prefix_messages.append(msg)
 
-    return boundaries
+    return turns
+
+
+def get_assistant_turn_boundaries(
+    messages: list[dict],
+    tokenizer: AutoTokenizer,
+) -> list[tuple[int, int]]:
+    """Find token-level (start, end) for each assistant turn."""
+    turns = get_turn_boundaries(messages, tokenizer)
+    return [(t["start"], t["end"]) for t in turns if t["role"] == "assistant"]
 
 
 def compute_log_likelihood(
@@ -231,6 +243,7 @@ def main():
 
     templated_prompts = []
     all_boundaries = []
+    all_turn_boundaries = []
     all_input_ids = []
 
     for row in ds_subset:
@@ -246,9 +259,11 @@ def main():
         full_ids = _template_to_ids(tokenizer, messages)
         all_input_ids.append(torch.tensor(full_ids, dtype=torch.long))
 
-        # Assistant token boundaries
-        boundaries = get_assistant_turn_boundaries(messages, tokenizer)
+        # Turn boundaries (all roles) and assistant-only subset
+        all_turns = get_turn_boundaries(messages, tokenizer)
+        boundaries = [(t["start"], t["end"]) for t in all_turns if t["role"] == "assistant"]
         all_boundaries.append(boundaries)
+        all_turn_boundaries.append(all_turns)
 
     logger.info(f"Templated {len(templated_prompts)} prompts")
     logger.info(
@@ -274,8 +289,9 @@ def main():
     )
     logger.info(f"Logits shape: {logits_batch.shape}")
 
-    # Compute per-example log-likelihood
+    # Compute per-example log-likelihood and cache trajectories
     results = []
+    trajectories = []
     for i in range(n):
         # Get the unpadded length for this example
         mask = attention_mask[i].bool()
@@ -309,6 +325,18 @@ def main():
         ll_result["index"] = int(ds_subset[i]["index"])
         ll_result["deceptive"] = bool(ds_subset[i]["deceptive"])
         results.append(ll_result)
+
+        # Cache trajectory
+        traj = compute_trajectory(
+            example_logits, example_ids, tokenizer,
+            metadata={
+                "index": int(ds_subset[i]["index"]),
+                "deceptive": bool(ds_subset[i]["deceptive"]),
+                "assistant_boundaries": all_boundaries[i],
+                "turn_boundaries": all_turn_boundaries[i],
+            },
+        )
+        trajectories.append(traj)
 
         if (i + 1) % 10 == 0 or i == 0:
             logger.info(
@@ -369,6 +397,11 @@ def main():
         with open(output_path, "w") as f:
             json.dump(summary, f, indent=2)
         logger.info(f"Results saved to {output_path}")
+
+        # Save trajectory cache
+        traj_path = output_path.with_suffix(".trajectories.pt")
+        save_trajectories(trajectories, traj_path)
+        logger.info(f"Trajectories cached to {traj_path} ({len(trajectories)} examples)")
     else:
         logger.error("No results computed!")
 

@@ -28,10 +28,19 @@ Thumbs.db
 # Model artifacts
 *.safetensors
 *.bin
-*.pt
 *.ckpt
+
+# Large binary artifacts
+*.pt
 
 # Activations / probe outputs
 activations/
 outputs/
-results/
+
+# Results: track summaries and key figures, ignore HTML interactives and test plots
+results/*.html
+results/test_*.png
+results/trajectory_demo.*
+
+# Scans (large, regeneratable)
+scans/

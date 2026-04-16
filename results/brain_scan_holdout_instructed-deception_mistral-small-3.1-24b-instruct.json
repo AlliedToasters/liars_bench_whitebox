@@ -1,0 +1,72 @@
+{
+  "model": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+  "dataset": "instructed-deception",
+  "n_train": 400,
+  "n_test": 100,
+  "seed": 42,
+  "signals": [
+    "attn_delta",
+    "mlp_delta"
+  ],
+  "n_components": 64,
+  "n_layers": 40,
+  "evaluation": "holdout_assistant_only",
+  "separability": {
+    "attn_delta": {
+      "top_layers": [
+        16,
+        17,
+        20,
+        15,
+        18,
+        19,
+        34,
+        26,
+        14,
+        13
+      ],
+      "top_aurocs": [
+        0.9763999999999999,
+        0.9368,
+        0.9304,
+        0.9232,
+        0.9144,
+        0.9047999999999999,
+        0.9016,
+        0.8912,
+        0.8795999999999999,
+        0.8792
+      ],
+      "max_auroc": 0.9763999999999999,
+      "mean_auroc": 0.8137000000000001
+    },
+    "mlp_delta": {
+      "top_layers": [
+        16,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        17,
+        18,
+        26
+      ],
+      "top_aurocs": [
+        0.9756,
+        0.9716,
+        0.9664,
+        0.9628,
+        0.9591999999999999,
+        0.9572,
+        0.9536,
+        0.9512,
+        0.9492,
+        0.9436
+      ],
+      "max_auroc": 0.9756,
+      "mean_auroc": 0.8517600000000002
+    }
+  }
+}
