@@ -110,6 +110,28 @@ For every deviation marked "yes," run a variant of the experiment matching the p
 
 ## 5. Core Experiments
 
+### 5.0 Experiment 0: Blinded protocol re-evaluation
+
+**Goal:** Establish the true performance of our method under proper blinding, and measure the magnitude of oracle leakage in our development results.
+
+**Context:** Prior to this revision, best-PC selection and best-layer selection were both performed using test-set labels on a per-cell basis. All previously reported cross-dataset AUROC numbers are therefore inflated by multiple-testing over ~5000+ (layer × signal × PC) candidates. This experiment produces the first honest numbers.
+
+**Procedure:**
+1. For each model, load the existing ID PCA basis.
+2. Project the committed ID dev split through the basis (GPU, cached).
+3. Select the best (layer, signal, PC, orientation) on ID dev labels only.
+4. Freeze this probe tuple.
+5. Project all committed held-out splits (ID held-out, HP-C, HP-KR, IT) through the same basis (GPU, cached).
+6. Evaluate the frozen probe on each held-out split. **No re-selection of any parameter.**
+7. Compare blinded results to previously-reported oracle results. The delta is the empirical leakage magnitude.
+
+**Reporting:**
+- Blinded results are the new headline numbers.
+- Oracle results are reported in a "Development results" appendix.
+- The leakage delta is disclosed in the paper's limitations section.
+
+**Stop condition:** If blinded results drop more than 0.15 AUROC below oracle results on any cell, pause and investigate before proceeding.
+
 ### 5.1 Experiment 1: Headline evaluation
 
 **Goal:** Measure probe performance on all LB datasets and target models, in the paper's protocol.
@@ -432,7 +454,8 @@ Fill in before running experiments. These are binding.
 - **Probe variants:** Three variants were tried during development: (1) full-sequence PCA + full-sequence eval (produced perfect AUROC due to prompt leakage), (2) full-sequence PCA + assistant-last-token eval (still leaked via PCA basis), (3) generative-only PCA + assistant-last-token eval (current approach). All three were evaluated on LB instructed-deception data. The progression was driven by diagnosing the leakage, not by fishing for the best number — but the end result is that the current variant was selected based on LB performance.
 - **Held-out LB slice:** **Yes.** We will create a 20% held-out slice of each LB dataset (stratified by label, seed=2026, documented) that has never been scored, plotted, or inspected. Primary results reported on held-out slice. Development-set results reported separately. The development set is everything we have scored to date (the 400-train/100-test splits used in our existing experiments).
 - **Models finalized:** The 4 target models are: `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, `google/gemma-3-27b-it`, `meta-llama/Llama-3.3-70B-Instruct`, `Qwen/Qwen2.5-72B-Instruct`. These are the same models used in Liar's Bench.
-- **Training data finalized:** D_train for the primary evaluation is LB instructed-deception (400 samples, seed=42, generative tokens only). **This is LB data, not external data.** The cross-dataset transfer claim is: a basis fit on LB instructed-deception generalizes to other LB datasets. We are not claiming to have trained on non-LB data. If we later add an external training corpus, it will be documented as an amendment. For the within-LB generalization claim, the leave-one-dataset-out design (Experiment 2) provides the strongest test.
+- **Training data finalized:** D_train for the primary evaluation is LB instructed-deception, using the committed 60/20/20 splits (seed=2026, generative tokens only). **This is LB data, not external data.** The cross-dataset transfer claim is: a basis fit on LB instructed-deception generalizes to other LB datasets. We are not claiming to have trained on non-LB data. If we later add an external training corpus, it will be documented as an amendment.
+- **Oracle leakage disclosure (caught during spec review, 2026-04-16):** Prior to this revision, best-PC selection AND best-layer selection were both performed using test-set labels on a per-cell basis. All previously reported cross-dataset AUROC numbers are therefore inflated by multiple-testing over ~5000+ (layer × signal × PC) candidates. The revised protocol (Experiment 0) freezes (layer, signal, PC index, orientation) based on the ID dev split only, before any test-set evaluation. All numbers in this paper are reported under the revised protocol. Prior oracle numbers are disclosed in a development-results appendix.
 
 ---
 
@@ -443,6 +466,7 @@ If any of the following occur during execution, stop and consult before continui
 - Scrambled-label control (5.5) produces AUROC > 0.55 on any (model, dataset) cell.
 - PPL of assistant responses under target model exceeds 2.0 on any dataset (indicates a pipeline mismatch).
 - Gemma (or any model) produces results >0.2 AUROC below the mean of the other models — investigate before interpreting.
+- Blinded results (Experiment 0) drop more than 0.15 AUROC below previously-reported oracle results on any cell — pause and investigate.
 - Experiment 3's V_neutral result shows ΔAUROC > 0.15 on ID or CG — primary claim likely needs scoping, discuss framing before proceeding to paper draft.
 
 ---
