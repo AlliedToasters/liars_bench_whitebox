@@ -2,40 +2,42 @@
 
 Core pipeline for whitebox deception detection using lmprobe's SampleScan.
 
-## On-Policy Activations
+## Activation Recovery via Deterministic Replay
 
-We extract activations by replaying the model's own transcripts from the Liar's Bench dataset through a forward pass. These activations are **on-policy**: they are identical to the activations the model produced during original generation.
+We extract activations by replaying the model's own transcripts from the Liar's Bench dataset through a forward pass. The activations we extract are identical to those produced during the original sampling run, because they depend only on the input token sequence and the (deterministic) forward pass.
 
-**Why this holds:** Transformer inference is deterministic given input tokens. At position `t`, the model sees tokens `0..t` and produces activations that depend only on that prefix (causal attention). Whether token `t+1` was sampled live or is pre-filled from a recorded transcript does not affect the activations at position `t`. Our forward pass replays the exact token sequence, so activations at each position are identical to what they were during generation.
+**Why this holds:** Transformer inference is deterministic given input tokens. At position `t`, the model sees tokens `0..t` and produces activations that depend only on that prefix (causal attention). Whether token `t+1` was sampled live or is pre-filled from a recorded transcript does not affect the activations at position `t`.
 
-**Empirical validation:** We verified this by computing per-token log-likelihood of the assistant's responses in the ground-truth transcripts (`on_policy_affirmation.py`):
+**Empirical validation:** We verified correct template reconstruction and tokenization by computing per-token log-likelihood of the assistant's responses in the ground-truth transcripts (`on_policy_affirmation.py`):
 
 | Model | Mean PPL | Median PPL | Mean LL | n |
 |---|---|---|---|---|
 | Mistral-Small-3.1-24B | 1.35 | 1.29 | -0.287 | 50 |
 | Gemma-3-27B-it | 1.44 | 1.35 | -0.338 | 50 |
 
-Perplexity near 1.0 confirms the model assigns high probability to the tokens it actually generated, validating correct template reconstruction, tokenization, and chunked execution. If any of these were wrong (e.g. incorrect chat template, model version mismatch), perplexity would be significantly higher.
+Perplexity near 1.0 confirms the model assigns high probability to the tokens it actually generated. If template reconstruction, tokenization, or chunked execution were incorrect, perplexity would be significantly higher. (n=50 is a validation check, not a statistical claim; expanding to all samples is straightforward.)
 
-**What "on-policy" means here:** The Liar's Bench transcripts were sampled from these models under specific prompting conditions. We measure activations on the trajectories the model actually took — not on counterfactual or adversarial inputs. This is the standard meaning of "on-policy" in the RL sense: the data distribution matches the policy being analyzed.
+**Terminology note:** This is sometimes called "on-policy" by analogy to RL, though strictly the term applies only to the primary evaluation where the token sequence reflects the model's original sampling policy. In the counterfactual system-prompt ablation (EXPERIMENT.md Section 5.3), the tokens reflect the original policy but the system-prompt context does not — this would not be considered on-policy in the strict RL sense, and we note this when reporting those results.
 
 ## Overview
 
 Two operations:
 
-1. **Fit**: Given labeled prompts `(X, Y)`, run a forward pass capturing activation deltas at every `(token, layer)`, fit PCA on the generative tokens to get a reusable basis.
-2. **Evaluate**: Given a fitted basis and new labeled prompts `(X', Y')`, project through the basis and compute classification metrics at the assistant's last token.
+1. **Fit**: Given labeled chat transcripts `(X, Y)`, run a forward pass capturing activation deltas at every `(token, layer)`, fit PCA on the generative tokens to get a reusable basis. Select the best PC direction and layer using training-set labels.
+2. **Evaluate**: Given a frozen probe (basis + PC index + layer + direction), project new transcripts through the basis and compute classification metrics at the assistant's last token. **No test labels are used during evaluation.**
 
-The basis is fit **once** on a training corpus and applied to any number of test prompts with no retraining. This is the core claim: a PCA basis fit on one deception scenario transfers zero-shot to other deception scenarios.
+The basis, PC index, layer, and direction sign are all frozen from the training set before any test evaluation. This is required for the zero-shot transfer claim to be valid.
 
-**Terminology note:** PCA fitting is unsupervised (labels are not used). However, the subsequent step of selecting the best PC direction uses labeled data (max AUROC over PCs). The overall method is therefore **unsupervised basis + supervised direction selection** — functionally a label-informed probe, not a purely unsupervised detector. We use "PCA-based probe" rather than "unsupervised probe" to avoid overclaiming.
+**Terminology note:** PCA fitting is unsupervised (labels are not used). However, two subsequent steps use labeled data: (a) selecting the best PC direction (max AUROC over PCs), and (b) selecting the best layer. The overall method is therefore **unsupervised basis + supervised direction and layer selection** — a label-informed probe. We use "PCA-based probe" rather than "unsupervised probe" to avoid overclaiming.
 
-## Step 1: Fit a Basis
+**Critical distinction from development results:** Our development-phase results (reported in `results/` and on GitHub Pages) used oracle PC and layer selection on the test data — selecting the best PC and best layer per evaluation cell using test labels. These numbers are inflated and are reported as development results only. The pre-registered evaluation (EXPERIMENT.md) freezes PC and layer from the ID training/dev set before any held-out evaluation.
+
+## Step 1: Fit a Basis and Freeze the Probe
 
 ### Inputs
-- `prompts: list[str]` — tokenized chat transcripts (system + user + assistant turns)
+- `transcripts: list[str]` — chat-templated sequences (system + user + assistant turns)
 - `labels: list[int]` — 1 = deceptive, 0 = truthful
-- `generative_masks: list[np.ndarray]` — boolean mask per prompt, True for assistant-turn tokens
+- `generative_masks: list[np.ndarray]` — boolean mask per transcript, True for assistant-turn tokens
 
 ### Why generative masks matter
 Without masking, PCA captures the dominant variance in the full sequence — which includes the system prompt. If deceptive and truthful conditions use different system prompts (as in instructed-deception), the basis trivially encodes the instruction text, not a deception representation. Generative-only PCA forces the basis to capture variance in the model's own output activations.
@@ -46,7 +48,7 @@ from lmprobe import SampleScan
 import torch
 
 scan = SampleScan.run(
-    prompts=train_prompts,        # list of chat-templated strings
+    prompts=train_transcripts,    # list of chat-templated strings
     labels=train_labels,          # list of 0/1
     model_name="meta-llama/Llama-3.3-70B-Instruct",
     scan_dir="scans/my_basis",    # where to store the basis
@@ -59,6 +61,19 @@ scan = SampleScan.run(
 )
 ```
 
+### Freezing the probe
+After fitting the basis, the probe is frozen by selecting the best layer, PC index, and direction sign on the **training or dev set** (never on test data):
+
+```python
+# Project training set through basis, extract assistant-last-token vectors
+# Select best (layer, signal, pc, direction) by max AUROC on training labels
+# Freeze these choices before any test evaluation
+frozen_layer = best_layer_from_train
+frozen_signal = best_signal_from_train
+frozen_pc = best_pc_from_train
+frozen_flip = direction_from_train
+```
+
 ### What gets stored
 ```
 scans/my_basis/
@@ -67,92 +82,71 @@ scans/my_basis/
   channels/0_global/basis_mlp_delta.npy   # [n_layers, hidden_dim, n_components]
   projections/values.npy                  # training set projections (sparse)
   projections/coords.parquet              # (sample_id, layer, token_pos, signal)
-  samples/samples.parquet                 # prompt text, labels, seq lengths
+  samples/samples.parquet                 # transcript text, labels, seq lengths
 ```
 
-The basis files (`basis_*.npy`) are the reusable artifact. Everything else is for analysis of the training set.
+The basis files (`basis_*.npy`) plus the frozen (layer, signal, pc, flip) constitute the complete probe. Everything else is for analysis of the training set.
 
 ## Step 2: Evaluate on a Test Set
 
 ### Inputs
-- A fitted `SampleScan` object (or loaded from disk)
-- `test_prompts: list[str]` — new chat-templated strings
-- `test_labels: list[int]` — ground truth
-- `asst_last_positions: list[int]` — token index of the last assistant token per prompt
+- A frozen probe: `SampleScan` object + (layer, signal, pc, flip)
+- `test_transcripts: list[str]` — new chat-templated sequences
+- `test_labels: list[int]` — ground truth (used ONLY for computing metrics, not for any selection)
+- `asst_last_positions: list[int]` — token index of the last assistant token per transcript
 
 ### Projection
 ```python
 scan = SampleScan("scans/my_basis")
 projections, coords, token_ids, seq_lengths = scan.batch_project(
-    test_prompts, batch_size=4
+    test_transcripts, batch_size=4
 )
 ```
 
 `batch_project` runs a single forward pass per layer chunk for ALL test samples, projecting activations onto the stored PCA basis. Returns sparse projections at every `(sample, layer, token, signal)`.
 
-### Extract evaluation vectors
-We evaluate at the **assistant's last token** — the position where the model has processed its full response and the deception signal is strongest.
-
+### Scoring with the frozen probe
 ```python
-# Extract [n_samples, n_layers, n_signals, n_components] array
-test_vecs = np.zeros((n_test, n_layers, n_signals, k), dtype=np.float32)
-
-coord_sample = np.array(coords["sample_id"])
-coord_layer = np.array(coords["layer"])
-coord_tok = np.array(coords["token_pos"])
-coord_sig = np.array(coords["signal"])
-
+# Extract scores at the frozen (layer, signal, pc) for each sample's last assistant token
 for i in range(n_test):
-    tok_pos = min(asst_last[i], seq_lengths[i] - 1)
-    for si, sig in enumerate(scan.signals):
-        mask = (coord_sample == i) & (coord_tok == tok_pos) & (coord_sig == sig)
-        for row_idx in np.where(mask)[0]:
-            test_vecs[i, coord_layer[row_idx], si, :] = projections[row_idx, 0, :]
-```
+    score = test_vecs[i, frozen_layer, frozen_signal, frozen_pc]
+    if frozen_flip:
+        score = -score
+    scores[i] = score
 
-### Compute metrics
-For each `(layer, signal)` pair, find the best PC direction (max AUROC), then compute:
-
-```python
-from sklearn.metrics import roc_auc_score, roc_curve, balanced_accuracy_score
-
-# Best PC selection
-auroc = roc_auc_score(labels, pc_vals)
-auroc = max(auroc, 1 - auroc)  # orient direction
-
-# Balanced accuracy at 1% FPR (paper's evaluation protocol)
-fpr, tpr, thresholds = roc_curve(labels, oriented_scores)
-idx = np.searchsorted(fpr, 0.01, side='right') - 1
-preds = (oriented_scores >= thresholds[idx]).astype(int)
-bal_acc_1pct = balanced_accuracy_score(labels, preds)
+# Compute metrics — labels used here for evaluation only
+auroc = roc_auc_score(test_labels, scores)
+fpr, tpr, thresholds = roc_curve(test_labels, scores)
+# ... balanced accuracy at 1% FPR, etc.
 ```
 
 ## Experimental Design
 
 ### Within-dataset holdout
-- **Train**: 400 samples (200 dec + 200 truth) — fit PCA basis
-- **Test**: 100 samples (50 + 50) — project through basis, compute metrics
-- Same dataset, disjoint samples, fixed seed=42
+- **Train** (60%): fit PCA basis + select layer/PC/direction
+- **Dev** (20%): validate probe choices, tune if needed
+- **Held-out** (20%): single frozen-probe evaluation, headline results
+- Same dataset, disjoint samples, seed=2026
 
 ### Cross-dataset transfer
-- **Basis**: fit on dataset A (e.g. instructed-deception)
-- **Test**: project dataset B samples (e.g. insider-trading) through A's basis
-- No retraining. Tests whether the deception direction generalizes.
+- **Probe**: frozen from ID train/dev (basis + layer + PC + direction)
+- **Test**: project other dataset samples through frozen probe, score with frozen direction
+- No retraining, no selection on test data. Tests whether the deception direction generalizes.
 
 ### Cross-fit matrix
-- For each available dataset, fit a basis. Evaluate every basis on every dataset.
+- For each available dataset, fit a basis and freeze a probe. Evaluate every frozen probe on every dataset.
 - Produces an N x N transfer matrix per model.
 - Diagonal = within-dataset holdout. Off-diagonal = transfer.
 
 ## Key Design Decisions
 
-1. **PCA basis with post-hoc direction selection.** The PCA basis captures directions of maximum variance in generative activations without using labels. The deception-discriminating direction is then selected post-hoc (the PC with max AUROC). This two-step approach avoids directly fitting a classifier to the training labels, but the direction selection step is label-informed and must be evaluated on held-out data.
+1. **PCA basis with post-hoc direction selection.** The PCA basis captures directions of maximum variance in generative activations without using labels. The deception-discriminating direction is then selected on the training set (the PC with max AUROC). This two-step approach avoids directly fitting a classifier to the training labels, but the direction selection step is label-informed and the full probe must be evaluated on held-out data.
 
 2. **Activation deltas, not raw activations.** We capture `attn_delta` (residual change from attention) and `mlp_delta` (residual change from MLP) rather than the full hidden state. These isolate what each sublayer *contributes*, not what it receives.
 
 3. **Assistant-last-token evaluation.** The model has processed its full response at this position. Earlier tokens may not yet reflect the deception strategy.
 
-4. **Generative-only PCA fitting.** Prevents the basis from encoding system prompt differences between conditions.
+4. **Generative-only PCA fitting.** Designed to reduce (but not guarantee elimination of) system prompt influence on the basis. See decontamination discussion below.
 
 ## Computational Approach
 
@@ -197,10 +191,12 @@ PCA is fit incrementally between layer chunks rather than after the full forward
 
 ### Hardware requirements
 
-| Model size | Backend | GPU VRAM | CPU RAM | Time (500 samples) |
-|---|---|---|---|---|
-| 24-27B | Chunked | 32 GB | 64 GB | ~5 min |
-| 70-72B | Disk offload | 32 GB | 128 GB | ~15 min |
+Times are from actual runs on an NVIDIA RTX 5090 (32 GB VRAM), including PCA fitting.
+
+| Model size | Backend | GPU VRAM | CPU RAM | Time (500 samples, fit) | Time (100 samples, eval) |
+|---|---|---|---|---|---|
+| 24-27B | Chunked | 32 GB | 64 GB | ~5 min | ~1 min |
+| 70-72B | Disk offload | 32 GB | 128 GB | ~15 min | ~3 min |
 
 ## Classification Under Liar's Bench Taxonomy
 
@@ -209,7 +205,7 @@ Following the taxonomy in Appendix C of the Liar's Bench paper (Kretschmar et al
 | Property | Classification | Notes |
 |---|---|---|
 | **Model access** | White-box | Reads activation deltas at every layer |
-| **Message scope** | Full (evaluated at assistant scope) | The forward pass processes the full sequence (system + user + assistant) — this is inherent to how transformers work. However, the signal we measure is decontaminated to assistant scope: PCA is fit only on generative (assistant-turn) tokens, and evaluation uses only the assistant's last token. See "Prompt leakage" below. |
+| **Message scope** | Full (with decontamination toward assistant scope) | The forward pass processes the full sequence. Assistant-turn activations carry information from earlier tokens via attention. Our three decontamination steps (below) are designed to reduce system-prompt influence, but do not guarantee elimination. See Experiment 3 in EXPERIMENT.md for empirical validation. |
 | **Interactivity** | Static | Single forward pass on the existing transcript. No additional tokens generated. |
 | **Semantic verification** | Incapable | The probe operates on activation geometry, not factual verification. It does not check whether claims are true. |
 
@@ -217,23 +213,26 @@ Following the taxonomy in Appendix C of the Liar's Bench paper (Kretschmar et al
 
 The instructed-deception dataset uses different system prompts for deceptive ("Try to deceive them") and truthful ("Answer truthfully") conditions. Initial analysis on the full token sequence yielded perfect AUROC (1.000) at multiple layers — this was **prompt leakage**, not deception detection. The model's activations trivially encode the instruction text.
 
-Three decontamination steps control for this:
+Three decontamination steps are designed to reduce this:
 
-1. **Generative-only PCA**: The basis is fit only on assistant-turn tokens, excluding system and user prompts from the variance computation.
-2. **Assistant-last-token evaluation**: Separability is computed at the last token of the assistant turn, not the last token of the full sequence.
-3. **Train/test holdout**: The basis is fit on 400 training samples and evaluated on 100 held-out test samples.
+1. **Generative-only PCA**: The basis is fit only on assistant-turn tokens, excluding system and user prompts from the variance computation. This controls what the basis captures as dominant variance, but does not prevent the basis from also capturing directions that correlate with system-prompt content in assistant-token activations via attention.
+2. **Assistant-last-token evaluation**: Separability is computed at the last token of the assistant turn, not the last token of the full sequence. This reads from a later position, but attention has already integrated system prompt information.
+3. **Train/test holdout**: The basis is fit on training samples and evaluated on held-out samples. This controls for overfitting, not for leakage.
 
-This reduces the effective message scope to **assistant-only** for the signal we report, even though the forward pass necessarily sees the full context. The decontamination steps are themselves a methodological contribution — they demonstrate awareness of the confound and provide a reproducible protocol for controlling it.
+These steps are plausible mitigations, not proof of assistant-scope signal. We test the residual leakage empirically via a counterfactual system-prompt ablation (EXPERIMENT.md Section 5.3): if probe scores on the same response tokens are invariant to system-prompt content, the signal is predominantly assistant-scope. Results will determine whether the assistant-scope claim is supported.
 
 ## Comparison with Liar's Bench Paper
 
-The paper evaluates linear probes at **1% FPR** and reports **balanced accuracy** and **AUROC**.
+Both our method and the paper's probes are whitebox (both use internal activations). The differences are methodological:
 
-Their results:
-- Mean probe: ~59% balanced accuracy on ID, near-chance on cross-dataset
-- Upper-bound probe (trained with privileged info on test set): 0.73 balanced accuracy, 0.91 AUROC
+**Paper's mean probe:** Logistic regression on activations, aggregated by mean over assistant response tokens (last 5 tokens excluded), at a fixed 20th-percentile layer. Trained on instructed-deception pairs. Evaluated across all LB datasets. Aggregate BalAcc ~0.54.
 
-Our approach differs in that:
-- We use internal activations (whitebox), not behavioral features
-- Our PCA basis is fit on one dataset and transfers zero-shot to others
-- We evaluate at the same 1% FPR threshold for direct comparison
+**Paper's upper-bound probe:** Same architecture, but trained with privileged access to 5 LB datasets (HP-C, HP-KR, CG, ID, IT) plus Alpaca control. Aggregate BalAcc 0.73, AUROC 0.91.
+
+**Our method:** Contrastive PCA basis with post-hoc best-PC selection, fit on generative-only tokens from a single LB dataset (instructed-deception), evaluated at assistant's last token. Layer and PC frozen from training set.
+
+Key protocol differences that must be ablated (see EXPERIMENT.md Section 3):
+- Layer: we search over all layers (on training data); they fix at 20th percentile
+- Token aggregation: we use last token; they use mean over response (excluding last 5)
+- Training data: we use one LB dataset; their upper bound uses five
+- Basis: we use PCA; they use logistic regression
