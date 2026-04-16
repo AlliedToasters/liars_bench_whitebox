@@ -1,0 +1,175 @@
+{
+  "seed": 2026,
+  "datasets": {
+    "instructed-deception": {
+      "split_ratio": "60/20/20",
+      "role": "training",
+      "models": {
+        "mistral-small-3.1-24b-instruct": {
+          "train": {
+            "deceptive": 1435,
+            "truthful": 1570
+          },
+          "dev": {
+            "deceptive": 478,
+            "truthful": 523
+          },
+          "held_out": {
+            "deceptive": 480,
+            "truthful": 524
+          }
+        },
+        "gemma-3-27b-it": {
+          "train": {
+            "deceptive": 1865,
+            "truthful": 1252
+          },
+          "dev": {
+            "deceptive": 621,
+            "truthful": 417
+          },
+          "held_out": {
+            "deceptive": 623,
+            "truthful": 418
+          }
+        },
+        "llama-v3.3-70b-instruct": {
+          "train": {
+            "deceptive": 1827,
+            "truthful": 1432
+          },
+          "dev": {
+            "deceptive": 609,
+            "truthful": 477
+          },
+          "held_out": {
+            "deceptive": 609,
+            "truthful": 478
+          }
+        },
+        "qwen-2.5-72b-instruct": {
+          "train": {
+            "deceptive": 1287,
+            "truthful": 1809
+          },
+          "dev": {
+            "deceptive": 429,
+            "truthful": 603
+          },
+          "held_out": {
+            "deceptive": 429,
+            "truthful": 603
+          }
+        }
+      }
+    },
+    "harm-pressure-choice": {
+      "split_ratio": "50/50",
+      "role": "cross-dataset-eval",
+      "models": {
+        "mistral-small-3.1-24b-instruct": {
+          "dev": {
+            "deceptive": 97,
+            "truthful": 348
+          },
+          "held_out": {
+            "deceptive": 98,
+            "truthful": 349
+          }
+        },
+        "llama-v3.3-70b-instruct": {
+          "dev": {
+            "deceptive": 67,
+            "truthful": 1000
+          },
+          "held_out": {
+            "deceptive": 67,
+            "truthful": 1000
+          }
+        },
+        "qwen-2.5-72b-instruct": {
+          "dev": {
+            "deceptive": 187,
+            "truthful": 1000
+          },
+          "held_out": {
+            "deceptive": 187,
+            "truthful": 1000
+          }
+        }
+      }
+    },
+    "harm-pressure-knowledge-report": {
+      "split_ratio": "50/50",
+      "role": "cross-dataset-eval",
+      "models": {
+        "mistral-small-3.1-24b-instruct": {
+          "dev": {
+            "deceptive": 348,
+            "truthful": 830
+          },
+          "held_out": {
+            "deceptive": 349,
+            "truthful": 831
+          }
+        },
+        "llama-v3.3-70b-instruct": {
+          "dev": {
+            "deceptive": 69,
+            "truthful": 1000
+          },
+          "held_out": {
+            "deceptive": 70,
+            "truthful": 1000
+          }
+        },
+        "qwen-2.5-72b-instruct": {
+          "dev": {
+            "deceptive": 285,
+            "truthful": 1000
+          },
+          "held_out": {
+            "deceptive": 286,
+            "truthful": 1000
+          }
+        }
+      }
+    },
+    "insider-trading": {
+      "split_ratio": "50/50",
+      "role": "cross-dataset-eval",
+      "models": {
+        "mistral-small-3.1-24b-instruct": {
+          "dev": {
+            "deceptive": 324,
+            "truthful": 743
+          },
+          "held_out": {
+            "deceptive": 324,
+            "truthful": 743
+          }
+        },
+        "gemma-3-27b-it": {
+          "dev": {
+            "deceptive": 940,
+            "truthful": 807
+          },
+          "held_out": {
+            "deceptive": 941,
+            "truthful": 807
+          }
+        },
+        "llama-v3.3-70b-instruct": {
+          "dev": {
+            "deceptive": 211,
+            "truthful": 328
+          },
+          "held_out": {
+            "deceptive": 212,
+            "truthful": 329
+          }
+        }
+      }
+    }
+  }
+}
