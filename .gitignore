@@ -45,3 +45,7 @@ results/trajectory_demo.*
 
 # Scans (large, regeneratable)
 scans/
+
+# Cached projections (large, regeneratable)
+experiment_cache/
+results/test_vecs_*.npz

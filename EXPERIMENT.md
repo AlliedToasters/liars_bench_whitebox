@@ -518,6 +518,24 @@ This section documents who has seen preliminary results and when.
 
 ---
 
+## Amendments
+
+### 2026-04-16: Paper-protocol verification corrections
+
+Source: `paper_protocol_verification.md`, produced per §A.3 prerequisite. Arxiv 2511.16035v2 HTML, fetched 2026-04-16.
+
+**Correction 1 (§3 aggregation row was wrong about the paper).** Our §3 table claimed the paper's aggregation excludes the last 5 tokens of the assistant response. This is not the paper's evaluation rule. The "last 5 tokens excluded" quote (§5.1 of the paper) refers to *training-data construction*: the paper appends a true fact to prompts with last-5 tokens removed so the model can complete it truthfully or deceptively. At evaluation, the paper takes the mean over all assistant tokens (system/user excluded, no last-N truncation). The `mean_excl5` variant in `experiment_pipeline.py` is therefore an *exploratory ablation*, not a paper-protocol-match. The paper-protocol-match variant is `mean_asst` (mean over all assistant tokens). The §3 "Response truncation" row is retracted; our choice (last-token only) is still a deviation, but the baseline to compare against is `mean_asst`, not `mean_excl5`.
+
+**Correction 2 (§2.4 Alpaca clarification).** The Alpaca control consists of 2,000 **model-generated** responses per target model (8,000 total), already released by LB in `data/alpaca/` (schema: `model, messages, deceptive, canary`). Calibration is per (model, method). This does not change the spec's calibration procedure, only the factual basis.
+
+**Correction 3 (§6.5.1 hero table footnote).** The paper's upper-bound probe (0.73 BalAcc, 0.91 AUROC) is an aggregate over **5 datasets** (HP-C, HP-KR, CG, ID, IT), not 7. The paper excludes GS and ST from the upper bound because each requires a separate fine-tuned variant. The hero table must footnote this. Our comparison to 0.73/0.91 is therefore only meaningful on the 5 upper-bound-trained datasets; on GS and ST the paper has no upper-bound point.
+
+**Correction 4 (§10 model IDs are unverified vs. paper).** The paper text does not specify exact HuggingFace model IDs. Our chosen IDs (`Mistral-Small-3.1-24B-Instruct-2503`, `gemma-3-27b-it`, `Llama-3.3-70B-Instruct`, `Qwen2.5-72B-Instruct`) are our best guesses matching the paper's named models. If a later check of LB release artifacts reveals a mismatch, it must be documented as a further amendment.
+
+These corrections adjust what we think the paper does. They do not change our own method or evaluation plan.
+
+---
+
 ## Appendix A: Liars' Bench Reference for Claude Code
 
 **If the LB paper PDF cannot be parsed locally, fetch from these URLs:**
