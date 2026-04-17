@@ -21,26 +21,30 @@ Perplexity near 1.0 confirms the model assigns high probability to the tokens it
 
 ## Overview
 
-Two operations:
+Three operations, fully decoupled:
 
-1. **Fit**: Given labeled chat transcripts `(X, Y)`, run a forward pass capturing activation deltas at every `(token, layer)`, fit PCA on the generative tokens to get a reusable basis. Select the best PC direction and layer using training-set labels.
-2. **Evaluate**: Given a frozen probe (basis + PC index + layer + direction), project new transcripts through the basis and compute classification metrics at the assistant's last token. **No test labels are used during evaluation.**
+1. **Fit basis** (unsupervised, Alpaca): Run a forward pass over Alpaca-train transcripts, fit PCA on assistant-token activation deltas at every `(layer, signal)`. Alpaca is general instruction-following data disjoint from LB. The basis captures content-general residual variance — it never sees deception labels or LB prompts.
+2. **Project** (Alpaca basis → LB splits + Alpaca-val): Run a fused forward pass projecting every evaluation transcript through the frozen basis, producing per-sample PC vectors at each `(layer, signal, reducer)`.
+3. **Fit + calibrate probe** (supervised, LB-train; threshold, Alpaca-val): Fit a linear probe over the 64-PC vectors on LB-train; select `(layer, signal, reducer)` on LB-dev; calibrate the 1% FPR threshold on Alpaca-val projections scored by the frozen probe.
 
-The basis, PC index, layer, and direction sign are all frozen from the training set before any test evaluation. This is required for the zero-shot transfer claim to be valid.
+Basis, probe coefficients, the selected `(layer, signal, reducer)` tuple, and the threshold are all frozen before any held-out evaluation. This is required for the zero-shot transfer claim to be valid.
 
-**Terminology note:** PCA fitting is unsupervised (labels are not used). However, two subsequent steps use labeled data: (a) selecting the best PC direction (max AUROC over PCs), and (b) selecting the best layer. The overall method is therefore **unsupervised basis + supervised direction and layer selection** — a label-informed probe. We use "PCA-based probe" rather than "unsupervised probe" to avoid overclaiming.
+**Why an Alpaca basis:** Fitting PCA on LB-ID training data concentrates the leading components on ID-specific structure (system-prompt contrast, instructed-deception task semantics). Fitting on Alpaca produces a general-purpose basis that's contrastive-neutral: a probe trained against it must find deception structure *inside* a content-general subspace, not inherit it from the basis. Cross-dataset transfer is then a probe-capacity claim, not a basis-coverage claim.
 
-**Critical distinction from development results:** Our development-phase results (reported in `results/` and on GitHub Pages) used oracle PC and layer selection on the test data — selecting the best PC and best layer per evaluation cell using test labels. These numbers are inflated and are reported as development results only. The pre-registered evaluation (EXPERIMENT.md) freezes PC and layer from the ID training/dev set before any held-out evaluation.
+**Terminology note:** The PCA basis is unsupervised and task-agnostic. The probe is supervised (linear classifier on PC vectors, fit on LB labels). `(layer, signal, reducer)` selection is label-informed on LB-dev. We call this a **general-purpose basis + supervised linear probe**.
 
-## Step 1: Fit a Basis and Freeze the Probe
+**Critical distinction from development results:** Our development-phase results (reported in `results/` and on GitHub Pages) used oracle PC and layer selection on the test data. These numbers are inflated and are reported as development results only. The pre-registered evaluation (EXPERIMENT.md) freezes all probe choices on LB-train/dev before held-out evaluation.
+
+## Step 1: Fit a General-Purpose Basis on Alpaca
 
 ### Inputs
-- `transcripts: list[str]` — chat-templated sequences (system + user + assistant turns)
-- `labels: list[int]` — 1 = deceptive, 0 = truthful
+- `transcripts: list[str]` — chat-templated Alpaca-train transcripts (1000/model, seed=2026)
 - `generative_masks: list[np.ndarray]` — boolean mask per transcript, True for assistant-turn tokens
 
-### Why generative masks matter
-Without masking, PCA captures the dominant variance in the full sequence — which includes the system prompt. If deceptive and truthful conditions use different system prompts (as in instructed-deception), the basis trivially encodes the instruction text, not a deception representation. Generative-only PCA forces the basis to capture variance in the model's own output activations.
+No labels are required at this step. Alpaca is all non-deceptive; the basis is fit unsupervised.
+
+### Why an Alpaca basis (and generative masks)
+Fitting PCA on LB-ID activations concentrates the leading components on the instructed-deception contrast (system prompts, task semantics). A probe built on that basis inherits its training scenario's structure and transfers poorly. Fitting on Alpaca produces a basis that captures general assistant-response variance without LB-specific signal. Generative masks ensure the basis is computed from the model's own output activations, not Alpaca's user prompts.
 
 ### Code
 ```python
@@ -48,105 +52,117 @@ from lmprobe import SampleScan
 import torch
 
 scan = SampleScan.run(
-    prompts=train_transcripts,    # list of chat-templated strings
-    labels=train_labels,          # list of 0/1
+    prompts=alpaca_train_transcripts,  # chat-templated Alpaca-train
+    labels=[0] * len(prompts),         # unused; stored for metadata only
     model_name="meta-llama/Llama-3.3-70B-Instruct",
-    scan_dir="scans/my_basis",    # where to store the basis
+    scan_dir="scans/alpaca_{model}",
     signals=["attn_delta", "mlp_delta"],
-    n_components=64,              # PCA components per layer per signal
+    n_components=64,
     device="cuda:0",
     dtype=torch.bfloat16,
-    generative_masks=train_masks, # only fit PCA on assistant tokens
-    backend="disk_offload",       # or "chunked" for models that fit in CPU RAM
+    generative_masks=alpaca_train_masks,
+    backend="disk_offload",  # or "chunked" for models that fit in CPU RAM
 )
-```
-
-### Freezing the probe
-After fitting the basis, the probe is frozen by selecting the best layer, PC index, and direction sign on the **training or dev set** (never on test data):
-
-```python
-# Project training set through basis, extract assistant-last-token vectors
-# Select best (layer, signal, pc, direction) by max AUROC on training labels
-# Freeze these choices before any test evaluation
-frozen_layer = best_layer_from_train
-frozen_signal = best_signal_from_train
-frozen_pc = best_pc_from_train
-frozen_flip = direction_from_train
 ```
 
 ### What gets stored
 ```
-scans/my_basis/
-  metadata.json                           # model info, n_layers, n_components
+scans/alpaca_{model}/
+  metadata.json
   channels/0_global/basis_attn_delta.npy  # [n_layers, hidden_dim, n_components]
-  channels/0_global/basis_mlp_delta.npy   # [n_layers, hidden_dim, n_components]
-  projections/values.npy                  # training set projections (sparse)
-  projections/coords.parquet              # (sample_id, layer, token_pos, signal)
-  samples/samples.parquet                 # transcript text, labels, seq lengths
+  channels/0_global/basis_mlp_delta.npy
+  projections/values.npy                  # Alpaca-train projections (not used downstream)
+  samples/samples.parquet
 ```
 
-The basis files (`basis_*.npy`) plus the frozen (layer, signal, pc, flip) constitute the complete probe. Everything else is for analysis of the training set.
+The `basis_*.npy` files are the only artifacts used downstream. The projections of Alpaca-train itself are incidental.
 
-## Step 2: Evaluate on a Test Set
+## Step 2: Project Evaluation Data Through the Frozen Basis
 
-### Inputs
-- A frozen probe: `SampleScan` object + (layer, signal, pc, flip)
-- `test_transcripts: list[str]` — new chat-templated sequences
-- `test_labels: list[int]` — ground truth (used ONLY for computing metrics, not for any selection)
-- `asst_last_positions: list[int]` — token index of the last assistant token per transcript
+One fused forward pass per model projects all evaluation data — LB splits (train/dev/held-out per dataset) **and** Alpaca-val — through the basis.
 
-### Projection
+### Code
 ```python
-scan = SampleScan("scans/my_basis")
-projections, coords, token_ids, seq_lengths = scan.batch_project(
-    test_transcripts, batch_size=4
+scan = SampleScan("scans/alpaca_{model}")
+
+# All evaluation prompts fused into a single dict.
+prompt_groups = {
+    ("instructed-deception", "train"):     id_train_transcripts,
+    ("instructed-deception", "dev"):       id_dev_transcripts,
+    ("instructed-deception", "held_out"):  id_held_transcripts,
+    ("harm-pressure-choice", "dev"):       hpc_dev_transcripts,
+    ("harm-pressure-choice", "held_out"):  hpc_held_transcripts,
+    # ... other LB datasets
+    ("alpaca", "val"):                     alpaca_val_transcripts,
+}
+
+results = scan.batch_project_reduced(
+    prompt_groups,
+    reducers={
+        "last_token": LastTokenReducer(masks_flat),
+        "mean_asst":  MeanReducer(masks_flat),
+        "mean_excl5": MeanExclLastNReducer(masks_flat, n=5),
+    },
+    batch_size=...,
 )
+# results[(ds, split)][reducer] → ndarray[n_samples, n_layers, n_signals, n_components]
 ```
 
-`batch_project` runs a single forward pass per layer chunk for ALL test samples, projecting activations onto the stored PCA basis. Returns sparse projections at every `(sample, layer, token, signal)`.
+Per-sample PC vectors are cached as `.npz` per `(model, dataset, split)`.
 
-### Scoring with the frozen probe
+## Step 3: Fit and Freeze the Probe
+
+### 3a. Fit on LB-train
+For each `(layer, signal, reducer)`, fit a supervised linear probe (logistic regression) over the 64-dim PC vectors on LB-train, producing coefficient vector `w[layer, signal, reducer]` and bias `b[layer, signal, reducer]`.
+
+### 3b. Select on LB-dev
+Score LB-dev under every candidate `(layer, signal, reducer)`; pick the tuple with max AUROC. Freeze `(layer*, signal*, reducer*, w*, b*)`.
+
+### 3c. Calibrate threshold on Alpaca-val
+Score the Alpaca-val PC vectors with the frozen probe. Set threshold `τ` such that FPR on Alpaca-val ≤ 1% (paper's protocol). Alpaca-val and Alpaca-train are disjoint; calibration never sees basis-fit data.
+
+### 3d. Evaluate on LB held-out
+Score held-out with `(w*, b*)` at `(layer*, signal*, reducer*)`; report AUROC (threshold-free), BalAcc and Recall at `τ`. No further tuning.
+
 ```python
-# Extract scores at the frozen (layer, signal, pc) for each sample's last assistant token
-for i in range(n_test):
-    score = test_vecs[i, frozen_layer, frozen_signal, frozen_pc]
-    if frozen_flip:
-        score = -score
-    scores[i] = score
-
-# Compute metrics — labels used here for evaluation only
-auroc = roc_auc_score(test_labels, scores)
-fpr, tpr, thresholds = roc_curve(test_labels, scores)
-# ... balanced accuracy at 1% FPR, etc.
+# Pseudocode
+w, b = fit_logreg(lb_train_vecs[:, l, s, r, :], lb_train_labels)
+auroc_dev = roc_auc_score(lb_dev_labels, lb_dev_vecs @ w + b)  # per tuple
+# ... pick best (l*, s*, r*)
+tau = quantile(alpaca_val_vecs @ w* + b*, 0.99)  # 1% FPR
+scores_held = lb_held_vecs @ w* + b*
 ```
 
 ## Experimental Design
 
-### Within-dataset holdout
-- **Train** (60%): fit PCA basis + select layer/PC/direction
-- **Dev** (20%): validate probe choices, tune if needed
-- **Held-out** (20%): single frozen-probe evaluation, headline results
-- Same dataset, disjoint samples, seed=2026
+### Three-way data split
+- **Alpaca-train** (1000/model, seed=2026): basis fit. Never scored.
+- **Alpaca-val** (1000/model, seed=2026): threshold calibration only. Disjoint from Alpaca-train.
+- **LB-train** (60% of ID, seed=2026): probe coefficient fit.
+- **LB-dev** (20% of ID, seed=2026): `(layer, signal, reducer)` selection.
+- **LB-held-out** (20% of ID, 50% of HP-C/HP-KR/IT, 100% of GS/CG): held-out evaluation.
 
-### Cross-dataset transfer
-- **Probe**: frozen from ID train/dev (basis + layer + PC + direction)
-- **Test**: project other dataset samples through frozen probe, score with frozen direction
-- No retraining, no selection on test data. Tests whether the deception direction generalizes.
+### Within-dataset evaluation
+- Fit probe on ID-train, select on ID-dev, calibrate on Alpaca-val, evaluate on ID-held-out.
 
-### Cross-fit matrix
-- For each available dataset, fit a basis and freeze a probe. Evaluate every frozen probe on every dataset.
-- Produces an N x N transfer matrix per model.
-- Diagonal = within-dataset holdout. Off-diagonal = transfer.
+### Cross-dataset transfer (zero-shot)
+- Same probe (fit on ID-train, selected on ID-dev), evaluate on HP-C / HP-KR / IT / GS / CG held-out. Same calibrated threshold.
+
+### Cross-fit variants (diagnostic)
+- LOO: fit probe on LB \ D_i, evaluate on D_i held-out. Shares basis + calibration.
+- Any probe-side change (different train set, different selection set) reuses the cached projections — no GPU work.
 
 ## Key Design Decisions
 
-1. **PCA basis with post-hoc direction selection.** The PCA basis captures directions of maximum variance in generative activations without using labels. The deception-discriminating direction is then selected on the training set (the PC with max AUROC). This two-step approach avoids directly fitting a classifier to the training labels, but the direction selection step is label-informed and the full probe must be evaluated on held-out data.
+1. **General-purpose Alpaca basis.** PCA is fit on Alpaca (non-deceptive, content-general) so the basis captures instruction-following variance without baking in LB structure. The deception-discriminating directions are learned by the supervised probe on top of PC vectors, not by the basis.
 
-2. **Activation deltas, not raw activations.** We capture `attn_delta` (residual change from attention) and `mlp_delta` (residual change from MLP) rather than the full hidden state. These isolate what each sublayer *contributes*, not what it receives.
+2. **Linear probe over 64 PCs.** We fit a logistic regression over the 64-dim PC vector at each `(layer, signal, reducer)`, rather than picking the single best PC. This uses the full subspace that PCA preserves and allows the probe to span directions not captured by any single component.
 
-3. **Assistant-last-token evaluation.** The model has processed its full response at this position. Earlier tokens may not yet reflect the deception strategy.
+3. **Decoupled basis / probe / calibration.** Each stage is fit on disjoint data (Alpaca-train / LB-train / Alpaca-val). No leakage across stages.
 
-4. **Generative-only PCA fitting.** Designed to reduce (but not guarantee elimination of) system prompt influence on the basis. See decontamination discussion below.
+4. **Activation deltas, not raw activations.** We capture `attn_delta` (residual change from attention) and `mlp_delta` (residual change from MLP) rather than the full hidden state. These isolate what each sublayer *contributes*, not what it receives.
+
+5. **Generative-only PCA fitting on Alpaca.** The basis is fit on Alpaca assistant tokens, not user prompts. This matches the evaluation-time aggregation scope (assistant-only) and keeps the basis focused on response-generation variance.
 
 ## Computational Approach
 
@@ -191,12 +207,16 @@ PCA is fit incrementally between layer chunks rather than after the full forward
 
 ### Hardware requirements
 
-Times are from actual runs on an NVIDIA RTX 5090 (32 GB VRAM), including PCA fitting.
+Times are from actual runs on an NVIDIA RTX 5090 (32 GB VRAM), including PCA fitting and fused projection.
 
-| Model size | Backend | GPU VRAM | CPU RAM | Time (500 samples, fit) | Time (100 samples, eval) |
-|---|---|---|---|---|---|
-| 24-27B | Chunked | 32 GB | 64 GB | ~5 min | ~1 min |
-| 70-72B | Disk offload | 32 GB | 128 GB | ~15 min | ~3 min |
+| Stage | 24–27B (chunked) | 70–72B (disk_offload) |
+|---|---|---|
+| Basis fit on Alpaca-train (1000 samples) | ~8 min | ~20 min |
+| Fused projection (all LB splits + Alpaca-val, ~8k samples) | ~20 min | ~60 min |
+| Probe fit + calibration + eval (CPU, from cached PC vectors) | <1 min | <1 min |
+| **Total per model** | ~30 min | ~80 min |
+
+Downstream probe analysis (LOO, cross-fit, ablations) operates entirely on the cached PC vectors — no GPU work.
 
 ## Classification Under Liar's Bench Taxonomy
 
@@ -211,15 +231,15 @@ Following the taxonomy in Appendix C of the Liar's Bench paper (Kretschmar et al
 
 ### Prompt leakage and decontamination
 
-The instructed-deception dataset uses different system prompts for deceptive ("Try to deceive them") and truthful ("Answer truthfully") conditions. Initial analysis on the full token sequence yielded perfect AUROC (1.000) at multiple layers — this was **prompt leakage**, not deception detection. The model's activations trivially encode the instruction text.
+Early development — when the PCA basis was fit on LB-ID — exhibited obvious prompt leakage: different system prompts for deceptive ("Try to deceive them") and truthful ("Answer truthfully") conditions drove the leading PCs, producing AUROC ≈ 1.0 at many layers via surface features rather than deception structure.
 
-Three decontamination steps are designed to reduce this:
+The revised methodology addresses this at the **basis** level by fitting PCA on Alpaca rather than LB:
 
-1. **Generative-only PCA**: The basis is fit only on assistant-turn tokens, excluding system and user prompts from the variance computation. This controls what the basis captures as dominant variance, but does not prevent the basis from also capturing directions that correlate with system-prompt content in assistant-token activations via attention.
-2. **Assistant-last-token evaluation**: Separability is computed at the last token of the assistant turn, not the last token of the full sequence. This reads from a later position, but attention has already integrated system prompt information.
-3. **Train/test holdout**: The basis is fit on training samples and evaluated on held-out samples. This controls for overfitting, not for leakage.
+1. **Alpaca basis**: PCA is fit on Alpaca transcripts, which share no prompts with LB and contain no deceptive/truthful contrast. The basis therefore cannot encode LB-specific instruction text as leading variance. Any signal the probe finds on LB data lives in directions the Alpaca basis preserves for content-general reasons.
+2. **Generative-only PCA on Alpaca**: the basis is computed from Alpaca assistant tokens only, matching the evaluation-time aggregation scope.
+3. **Decoupled probe fit**: the probe coefficients are fit on LB-train PC vectors, not raw activations. This means the probe only has access to subspace information preserved by the (LB-agnostic) Alpaca basis.
 
-These steps are plausible mitigations, not proof of assistant-scope signal. We test the residual leakage empirically via a counterfactual system-prompt ablation (EXPERIMENT.md Section 5.3): if probe scores on the same response tokens are invariant to system-prompt content, the signal is predominantly assistant-scope. Results will determine whether the assistant-scope claim is supported.
+Residual concern: assistant-token activations under LB prompts still integrate the system prompt via attention, so the probe can, in principle, latch onto basis directions that happen to correlate with system-prompt content once LB is projected. The counterfactual system-prompt ablation (EXPERIMENT.md §5.3) tests this residual empirically.
 
 ## Comparison with Liar's Bench Paper
 
@@ -229,10 +249,10 @@ Both our method and the paper's probes are whitebox (both use internal activatio
 
 **Paper's upper-bound probe:** Same architecture, but trained with privileged access to 5 LB datasets (HP-C, HP-KR, CG, ID, IT) plus Alpaca control. Aggregate BalAcc 0.73, AUROC 0.91.
 
-**Our method:** Contrastive PCA basis with post-hoc best-PC selection, fit on generative-only tokens from a single LB dataset (instructed-deception), evaluated at assistant's last token. Layer and PC frozen from training set.
+**Our method:** General-purpose PCA basis fit on Alpaca-train (unsupervised), linear probe fit on LB-train over 64-dim PC vectors, `(layer, signal, reducer)` selected on LB-dev, threshold calibrated on Alpaca-val at 1% FPR. Primary training signal is LB-ID; cross-dataset evaluation is zero-shot.
 
 Key protocol differences that must be ablated (see EXPERIMENT.md Section 3):
-- Layer: we search over all layers (on training data); they fix at 20th percentile
-- Token aggregation: we use last token; they use mean over response (excluding last 5)
-- Training data: we use one LB dataset; their upper bound uses five
-- Basis: we use PCA; they use logistic regression
+- Layer: we search over all layers on LB-dev; they fix at 20th percentile
+- Token aggregation: we select reducer on LB-dev (last_token / mean_asst / mean_excl5); they use mean_excl5
+- Basis: we fit PCA on Alpaca (LB-disjoint) then a linear probe on PC vectors; they fit logistic regression directly on activations
+- Training data: LB-ID for probe coefficients; their upper bound uses five LB datasets directly
