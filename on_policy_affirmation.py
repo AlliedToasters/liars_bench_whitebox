@@ -26,10 +26,10 @@ from pathlib import Path
 import torch
 import numpy as np
 from datasets import load_from_disk
-from transformers import AutoTokenizer
-
 from lmprobe.backends import resolve_backend
+
 from trajectory_cache import compute_trajectory, save_trajectories
+from util import AutoTokenizer, safe_load_tokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -223,7 +223,7 @@ def main():
     logger.info(f"Using {n} examples")
 
     # Load tokenizer and apply chat template
-    tokenizer = AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True)
+    tokenizer = safe_load_tokenizer
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

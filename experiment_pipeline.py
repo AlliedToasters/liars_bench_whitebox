@@ -34,7 +34,8 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import (roc_auc_score, roc_curve, balanced_accuracy_score,
                               average_precision_score, recall_score, f1_score)
-from transformers import AutoTokenizer
+
+from util import safe_load_tokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ def _load_tokenizer(model_name):
     Mistral-Small-3.1 and some other releases ship the chat template as a
     separate file rather than in tokenizer_config.json.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = safe_load_tokenizer(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.chat_template is None:
