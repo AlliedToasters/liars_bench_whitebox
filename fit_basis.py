@@ -1,29 +1,16 @@
-"""Fit PCA bases for the experimental pipeline.
-
-Extracted from the legacy `run_all_scans.py` (see git history prior to
-2026-04-16 for the full file) as the only part of that script still
-required going forward. Everything else (`run_holdout_scan`,
-`run_cross_dataset`, `run_cross_fit_matrix`, `generate_plots`) is
-superseded by `experiment_pipeline.py` under Experiment 0's blinded
-protocol and has been retired.
+"""Fit PCA bases on Alpaca-train for the experimental pipeline.
 
 What this script does
 ---------------------
-For a target model, fit a PCA basis on the committed instructed-deception
-train split (per `splits/instructed-deception_<model>.json`, seed=2026),
-capturing `attn_delta` and `mlp_delta` at every layer, with generative
-masks so PCA is fit only on assistant tokens. Writes the resulting
-SampleScan to `scans/instructed-deception_<model>_holdout/`.
+For a target model, fit a PCA basis on the committed Alpaca-train split
+(per `splits/alpaca_<model>.json`, seed=2026, 1000 samples), capturing
+`attn_delta` and `mlp_delta` at every layer, with generative masks so
+PCA is fit only on assistant tokens. Writes the resulting SampleScan to
+`scans/alpaca_<model>/`.
 
-Note on existing bases
-----------------------
-The `scans/` directories currently on disk were fit by the legacy
-`run_all_scans.py` using a random 400-train / 100-test split (seed=42)
-before the frozen 60/20/20 protocol was adopted. Under EXPERIMENT.md §10
-the bases should be fit on the committed train partition; this script
-is the protocol-aligned path for any future refit. The existing bases
-are retained (development-set artifacts) until a refit is run
-deliberately.
+This is the "general-purpose basis" step of the pivoted methodology
+(see EXPERIMENT.md amendment 2026-04-17 and METHODS.md Step 1). The
+basis is unsupervised — labels are passed as zeros for metadata only.
 
 Usage
 -----
@@ -79,11 +66,7 @@ MODELS = {
 
 
 def _load_tokenizer(model_name: str):
-    """Load tokenizer, fetching chat_template.json from HF hub if not embedded.
-
-    Mistral-Small-3.1 and some other releases ship the chat template as a
-    separate file rather than in tokenizer_config.json.
-    """
+    """Load tokenizer, fetching chat_template.json from HF hub if not embedded."""
     tokenizer = safe_load_tokenizer(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -99,20 +82,19 @@ def _load_tokenizer(model_name: str):
     return tokenizer
 
 
-def _load_train_indices(model_key: str) -> list[int]:
-    """Load the frozen instructed-deception train split (seed=2026)."""
-    split_file = Path("splits") / f"instructed-deception_{model_key}.json"
+def _load_alpaca_train_indices(model_key: str) -> list[int]:
+    """Load the frozen Alpaca-train split (seed=2026, 1000 samples)."""
+    split_file = Path("splits") / f"alpaca_{model_key}.json"
     with open(split_file) as f:
         splits = json.load(f)
-    train = splits["train"]
-    return list(train["deceptive"]) + list(train["truthful"])
+    return list(splits["train"])
 
 
-def _build_train_corpus(model_key: str, tokenizer):
-    """Build train prompts + labels + generative masks from the committed split."""
-    indices = _load_train_indices(model_key)
-    loaded = load_from_disk("data/instructed-deception")
-    ds = loaded["test"] if isinstance(loaded, dict) else loaded
+def _build_alpaca_train_corpus(model_key: str, tokenizer):
+    """Build Alpaca-train prompts + generative masks for basis fit."""
+    indices = _load_alpaca_train_indices(model_key)
+    loaded = load_from_disk("data/alpaca")
+    ds = loaded["test"] if hasattr(loaded, "keys") else loaded
     ds_filtered = ds.filter(lambda x: x["model"] == model_key)
 
     prompts: list[str] = []
@@ -122,7 +104,7 @@ def _build_train_corpus(model_key: str, tokenizer):
     for idx in indices:
         row = ds_filtered[idx]
         prompts.append(tokenizer.apply_chat_template(row["messages"], tokenize=False))
-        labels.append(1 if row["deceptive"] else 0)
+        labels.append(0)  # Alpaca is all non-deceptive; label is metadata-only
         boundaries = get_assistant_turn_boundaries(row["messages"], tokenizer)
         ids = _template_to_ids(tokenizer, row["messages"])
         mask = np.zeros(len(ids), dtype=bool)
@@ -130,13 +112,12 @@ def _build_train_corpus(model_key: str, tokenizer):
             mask[s:min(e, len(ids))] = True
         masks.append(mask)
 
-    logger.info(f"  train corpus: {len(prompts)} samples "
-                f"({sum(labels)} deceptive, {len(labels) - sum(labels)} truthful)")
+    logger.info(f"  alpaca-train corpus: {len(prompts)} samples")
     return prompts, labels, masks
 
 
 def fit_basis(model_cfg: dict, device: str = "cuda:0", force: bool = False) -> SampleScan:
-    """Fit the instructed-deception PCA basis for a model and write to disk.
+    """Fit the Alpaca-train PCA basis for a model and write to disk.
 
     Returns the fitted SampleScan. If an existing scan is present and
     `force=False`, reuses it rather than refitting.
@@ -146,15 +127,15 @@ def fit_basis(model_cfg: dict, device: str = "cuda:0", force: bool = False) -> S
     short = model_cfg["short"]
     backend_type = model_cfg["backend"]
 
-    scan_dir = Path("scans") / f"instructed-deception_{model_key}_holdout"
+    scan_dir = Path("scans") / f"alpaca_{model_key}"
 
     if scan_dir.exists() and (scan_dir / "metadata.json").exists() and not force:
         logger.info(f"=== {short}: basis already at {scan_dir} (use --force to refit) ===")
         return SampleScan(str(scan_dir))
 
-    logger.info(f"=== Fitting basis for {short} ({model_name}, backend={backend_type}) ===")
+    logger.info(f"=== Fitting Alpaca basis for {short} ({model_name}, backend={backend_type}) ===")
     tokenizer = _load_tokenizer(model_name)
-    prompts, labels, masks = _build_train_corpus(model_key, tokenizer)
+    prompts, labels, masks = _build_alpaca_train_corpus(model_key, tokenizer)
 
     scan = SampleScan.run(
         prompts=prompts,

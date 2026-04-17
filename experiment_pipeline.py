@@ -1,27 +1,27 @@
-"""Pre-registered experiment pipeline.
+"""Pre-registered experiment pipeline (Alpaca-basis methodology).
 
 Two phases:
-  1. GPU phase: project all splits through bases, cache everything.
-  2. CPU phase: evaluate frozen probes, run ablations, compute metrics.
+  1. GPU phase: fit Alpaca-train basis once per model (fit_basis.py), then
+     project all LB splits + Alpaca-val through the basis in one fused
+     sweep per model (this file, cache_all).
+  2. CPU phase: fit linear probe on LB-ID train PC vectors, select
+     (layer, signal, reducer) on LB-ID dev, calibrate 1% FPR threshold
+     on Alpaca-val, evaluate on held-out splits.
 
-GPU phase runs once. CPU phase runs in <1 second per evaluation cell,
-supporting rapid iteration on probe selection, ablations, and baselines.
+GPU phase runs once per model. CPU phase runs in seconds and supports
+rapid iteration on probe variants, ablations, and baselines — all on
+cached PC vectors.
 
 Usage:
-  # Phase 1 (fused, recommended): one pass caches every LB split + Alpaca.
-  # Amortizes layer streaming across all datasets. Use for new models.
+  # Prereq: fit the Alpaca basis first.
+  python fit_basis.py --model mistral
+
+  # Phase 1: fused projection of every LB split + Alpaca-val.
   python experiment_pipeline.py cache_all --model mistral
-  python experiment_pipeline.py cache_all --model all
 
-  # Phase 1 (legacy, per-dataset): preserved for partial reruns.
-  python experiment_pipeline.py cache --model mistral
-  python experiment_pipeline.py alpaca --model mistral
-
-  # Phase 2: evaluate with blinded protocol + Alpaca-calibrated threshold (CPU)
-  python experiment_pipeline.py evaluate --model all
-
-  # Phase 2b: run all ablations and baselines (CPU, seconds)
-  python experiment_pipeline.py ablations --model all
+  # Phase 2: fit probe on ID train, select on ID dev, calibrate on
+  # Alpaca-val, evaluate on held-out. Prints a summary table.
+  python experiment_pipeline.py evaluate --model mistral
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ import logging
 from pathlib import Path
 
 import numpy as np
-from sklearn.metrics import (roc_auc_score, roc_curve, balanced_accuracy_score,
-                              average_precision_score, recall_score, f1_score)
+from sklearn.metrics import (roc_auc_score, balanced_accuracy_score,
+                              average_precision_score, recall_score)
 
 from util import safe_load_tokenizer
 
@@ -128,296 +128,28 @@ def _get_transcripts_and_boundaries(ds_name, model_key, indices, tokenizer):
     return transcripts, np.array(labels), asst_boundaries
 
 
-def _extract_aggregated_vecs(scan, transcripts, asst_boundaries, tokenizer):
-    """Project transcripts and extract three aggregation variants.
+def _build_asst_masks_flat(transcripts_flat, boundaries_flat, tokenizer):
+    """Build one `[seq_len_i]` bool mask per transcript, ``True`` at
+    assistant-token positions.
 
-    Returns dict with:
-      'last_token': [n, n_layers, n_signals, k] — assistant's last token
-      'mean_asst': [n, n_layers, n_signals, k] — mean over all assistant tokens
-      'mean_excl5': [n, n_layers, n_signals, k] — mean over assistant tokens, last 5 excluded
+    Masks must match lmprobe's tokenization exactly — the reducer
+    contract is that ``len(mask[i])`` equals the number of real tokens
+    in the microbatch — so we tokenize with the same call pattern
+    lmprobe uses (``padding=True`` on the full flat list) and read real
+    lens off the attention mask.
     """
-    n_layers = scan.n_layers
-    n_signals = len(scan.signals)
-    k = scan.n_components
-    n = len(transcripts)
+    enc = tokenizer(transcripts_flat, return_tensors="pt", padding=True)
+    attn = enc["attention_mask"]
+    seq_lens = [int(row.sum()) for row in attn]
+    del enc, attn
 
-    # Adaptive chunk and inner batch size. Outer `chunk` = samples per
-    # batch_project call = amortization factor for layer-streaming cost
-    # (dominant with chunked backend). Inner `inner_bs` = microbatch size
-    # for the forward pass = memory pressure for activations. With SDPA
-    # (lmprobe default as of 2026-04-16) inner_bs can go higher on long
-    # sequences since the T×T softmax tensor isn't materialized. Length
-    # probed from the LONGEST sample, not the first, to avoid undersizing
-    # chunks when a short sample happens to sit at index 0.
-    sample_len = max(len(tokenizer.encode(t)) for t in transcripts[:min(len(transcripts), 32)])
-    if sample_len > 1500:
-        chunk, inner_bs = 300, 1
-    elif sample_len > 1000:
-        chunk, inner_bs = 400, 2
-    elif sample_len > 500:
-        chunk, inner_bs = 600, 2
-    else:
-        chunk, inner_bs = 1000, 4
-
-    last_token_vecs = np.zeros((n, n_layers, n_signals, k), dtype=np.float32)
-    mean_asst_vecs = np.zeros((n, n_layers, n_signals, k), dtype=np.float32)
-    mean_excl5_vecs = np.zeros((n, n_layers, n_signals, k), dtype=np.float32)
-
-    sig_names = scan.signals
-
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n)
-        chunk_transcripts = transcripts[start:end]
-
-        projections, coords, _, seq_lengths = scan.batch_project(
-            chunk_transcripts, batch_size=min(inner_bs, len(chunk_transcripts))
-        )
-
-        coord_sample = np.array(coords["sample_id"])
-        coord_layer = np.array(coords["layer"])
-        coord_tok = np.array(coords["token_pos"])
-        coord_sig = np.array(coords["signal"])
-
-        for i in range(len(chunk_transcripts)):
-            global_i = start + i
-            boundaries = asst_boundaries[global_i]
-            if not boundaries:
-                continue
-
-            # Get all assistant token positions from boundaries
-            asst_positions = set()
-            for s, e in boundaries:
-                for t in range(s, min(e, seq_lengths[i])):
-                    asst_positions.add(t)
-
-            if not asst_positions:
-                continue
-
-            last_asst = max(asst_positions)
-            asst_sorted = sorted(asst_positions)
-            excl5_positions = asst_sorted[:-5] if len(asst_sorted) > 5 else asst_sorted
-
-            for si, sig in enumerate(sig_names):
-                sample_mask = (coord_sample == i) & (coord_sig == sig)
-                sample_rows = np.where(sample_mask)[0]
-
-                # Collect per-token projections for this sample/signal
-                for row_idx in sample_rows:
-                    layer = coord_layer[row_idx]
-                    tok = coord_tok[row_idx]
-                    vec = projections[row_idx, 0, :]
-
-                    # Last token
-                    if tok == last_asst:
-                        last_token_vecs[global_i, layer, si, :] = vec
-
-                    # Mean over assistant (accumulate, divide later)
-                    if tok in asst_positions:
-                        mean_asst_vecs[global_i, layer, si, :] += vec
-
-                    # Mean excluding last 5
-                    if tok in set(excl5_positions):
-                        mean_excl5_vecs[global_i, layer, si, :] += vec
-
-            # Normalize means
-            n_asst = len(asst_positions)
-            n_excl5 = len(excl5_positions)
-            if n_asst > 0:
-                mean_asst_vecs[global_i] /= n_asst
-            if n_excl5 > 0:
-                mean_excl5_vecs[global_i] /= n_excl5
-
-        logger.info(f"    [{end}/{n}] projected")
-
-    return {
-        "last_token": last_token_vecs,
-        "mean_asst": mean_asst_vecs,
-        "mean_excl5": mean_excl5_vecs,
-    }
-
-
-def _aggregate_group_projections(
-    projections, coords, seq_lengths, asst_boundaries,
-    n_layers, n_signals, k, sig_names,
-):
-    """Aggregate per-group projections from a single `batch_project_grouped`
-    call into the three per-sample variants (last_token, mean_asst, mean_excl5).
-
-    Pure numpy — no forward passes. Called once per group after the single
-    fused sweep. `projections`/`coords` come from the rebased per-group
-    tuple returned by `scan.batch_project_grouped`.
-    """
-    n = len(seq_lengths)
-    last_token_vecs = np.zeros((n, n_layers, n_signals, k), dtype=np.float32)
-    mean_asst_vecs = np.zeros((n, n_layers, n_signals, k), dtype=np.float32)
-    mean_excl5_vecs = np.zeros((n, n_layers, n_signals, k), dtype=np.float32)
-
-    coord_sample = np.asarray(coords["sample_id"])
-    coord_layer = np.asarray(coords["layer"])
-    coord_tok = np.asarray(coords["token_pos"])
-    coord_sig = np.asarray(coords["signal"])
-
-    for i in range(n):
-        boundaries = asst_boundaries[i]
-        if not boundaries:
-            continue
-
-        asst_positions = set()
+    masks = []
+    for seq_len, boundaries in zip(seq_lens, boundaries_flat):
+        m = np.zeros(seq_len, dtype=bool)
         for s, e in boundaries:
-            for t in range(s, min(e, seq_lengths[i])):
-                asst_positions.add(t)
-        if not asst_positions:
-            continue
-
-        last_asst = max(asst_positions)
-        asst_sorted = sorted(asst_positions)
-        excl5_set = set(asst_sorted[:-5] if len(asst_sorted) > 5 else asst_sorted)
-
-        for si, sig in enumerate(sig_names):
-            sample_mask = (coord_sample == i) & (coord_sig == sig)
-            sample_rows = np.where(sample_mask)[0]
-
-            for row_idx in sample_rows:
-                layer = coord_layer[row_idx]
-                tok = coord_tok[row_idx]
-                vec = projections[row_idx, 0, :]
-
-                if tok == last_asst:
-                    last_token_vecs[i, layer, si, :] = vec
-                if tok in asst_positions:
-                    mean_asst_vecs[i, layer, si, :] += vec
-                if tok in excl5_set:
-                    mean_excl5_vecs[i, layer, si, :] += vec
-
-        n_asst = len(asst_positions)
-        n_excl5 = len(excl5_set)
-        if n_asst > 0:
-            mean_asst_vecs[i] /= n_asst
-        if n_excl5 > 0:
-            mean_excl5_vecs[i] /= n_excl5
-
-    return {
-        "last_token": last_token_vecs,
-        "mean_asst": mean_asst_vecs,
-        "mean_excl5": mean_excl5_vecs,
-    }
-
-
-def cache_projections(model_cfg):
-    """GPU phase: project all splits through the ID basis, cache everything."""
-    model_name = model_cfg["hf_id"]
-    model_key = model_cfg["dataset_key"]
-    short = model_cfg["short"]
-
-    from lmprobe import SampleScan
-
-    # Load the existing ID basis
-    scan_dir = f"scans/instructed-deception_{model_key}_holdout"
-    if not Path(scan_dir).exists():
-        logger.error(f"No ID basis found at {scan_dir}. Run the basis fit first.")
-        return
-    scan = SampleScan(scan_dir)
-    tokenizer = _load_tokenizer(model_name)
-
-    logger.info(f"=== Caching projections for {short} ===")
-
-    for ds_name in DATASETS:
-        splits = _load_split_indices(ds_name, model_key)
-        if splits is None:
-            logger.info(f"  {ds_name}: no split file, skipping")
-            continue
-
-        for split_name, split_data in splits.items():
-            cache_path = CACHE_DIR / model_key / ds_name / f"{split_name}.npz"
-            if cache_path.exists():
-                logger.info(f"  {ds_name}/{split_name}: already cached")
-                continue
-
-            # Combine deceptive + truthful indices
-            indices = split_data["deceptive"] + split_data["truthful"]
-            if len(indices) == 0:
-                continue
-
-            logger.info(f"  {ds_name}/{split_name}: projecting {len(indices)} samples...")
-            transcripts, labels, asst_boundaries = _get_transcripts_and_boundaries(
-                ds_name, model_key, indices, tokenizer
-            )
-
-            vecs = _extract_aggregated_vecs(scan, transcripts, asst_boundaries, tokenizer)
-
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(
-                cache_path,
-                last_token=vecs["last_token"],
-                mean_asst=vecs["mean_asst"],
-                mean_excl5=vecs["mean_excl5"],
-                labels=labels,
-            )
-            logger.info(f"    Cached → {cache_path} ({vecs['last_token'].shape})")
-
-    logger.info(f"=== Done caching {short} ===")
-
-
-def cache_alpaca(model_cfg):
-    """GPU phase: project the Alpaca control set through the ID basis.
-
-    Alpaca is the threshold-calibration control (paper §5.1): for each model,
-    2000 model-generated responses to Alpaca prompts. We project them through
-    the same ID basis used for the main probe, cache the three aggregation
-    variants, and later use scores here to set the 1% FPR decision threshold.
-    """
-    model_name = model_cfg["hf_id"]
-    model_key = model_cfg["dataset_key"]
-    short = model_cfg["short"]
-
-    from datasets import load_from_disk
-    from lmprobe import SampleScan
-    from on_policy_affirmation import get_assistant_turn_boundaries
-
-    scan_dir = f"scans/instructed-deception_{model_key}_holdout"
-    if not Path(scan_dir).exists():
-        logger.error(f"No ID basis found at {scan_dir}. Run the basis fit first.")
-        return
-    scan = SampleScan(scan_dir)
-    tokenizer = _load_tokenizer(model_name)
-
-    cache_path = CACHE_DIR / model_key / "alpaca" / "control.npz"
-    if cache_path.exists():
-        logger.info(f"=== {short} Alpaca already cached at {cache_path} ===")
-        return
-
-    logger.info(f"=== Caching Alpaca control for {short} ===")
-    loaded = load_from_disk("data/alpaca")
-    ds = loaded["test"] if isinstance(loaded, dict) else loaded
-    ds_filtered = ds.filter(lambda x: x["model"] == model_key)
-    n = len(ds_filtered)
-    if n == 0:
-        logger.error(f"  No Alpaca rows for model_key={model_key}")
-        return
-    logger.info(f"  {n} Alpaca responses for {model_key}")
-
-    transcripts = []
-    labels = []  # all False for Alpaca (control set), kept for shape consistency
-    asst_boundaries = []
-    for row in ds_filtered:
-        text = tokenizer.apply_chat_template(row["messages"], tokenize=False)
-        transcripts.append(text)
-        labels.append(1 if row["deceptive"] else 0)
-        boundaries = get_assistant_turn_boundaries(row["messages"], tokenizer)
-        asst_boundaries.append(boundaries)
-
-    vecs = _extract_aggregated_vecs(scan, transcripts, asst_boundaries, tokenizer)
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        cache_path,
-        last_token=vecs["last_token"],
-        mean_asst=vecs["mean_asst"],
-        mean_excl5=vecs["mean_excl5"],
-        labels=np.array(labels),
-    )
-    logger.info(f"  Cached → {cache_path} ({vecs['last_token'].shape})")
-    logger.info(f"=== Done caching Alpaca for {short} ===")
+            m[s:min(e, seq_len)] = True
+        masks.append(m)
+    return masks
 
 
 def _pick_inner_bs(max_len):
@@ -434,101 +166,172 @@ def _pick_inner_bs(max_len):
 
 def _fused_sweep_and_cache(scan, prompt_groups, boundaries_groups, labels_groups,
                             cache_paths, tokenizer):
-    """Run one fused layer-streaming sweep over `prompt_groups`, then
-    aggregate and write per-group .npz caches. Returns total samples
-    processed."""
+    """Run one fused layer-streaming sweep over `prompt_groups`, applying
+    per-sample reducers in-chunk, and write per-group .npz caches.
+
+    Uses `SampleScan.batch_project_reduced` (lmprobe spec 003): each
+    microbatch's PCA projection is dispatched to LastTokenReducer /
+    MeanReducer / MeanExclLastNReducer(n=5) as soon as it's produced on
+    GPU, then freed. Per-token projections never accumulate across
+    chunks — cross-chunk memory stays bounded by (residuals +
+    ~O(N_total × L × n_sig × k) reducer outputs), independent of
+    sequence length or chunk count.
+
+    Returns total samples processed.
+    """
+    from lmprobe.reducers import (
+        LastTokenReducer,
+        MeanExclLastNReducer,
+        MeanReducer,
+    )
+
     if not prompt_groups:
         return 0
 
-    max_len = 0
-    for transcripts in prompt_groups.values():
-        probe = transcripts[:min(len(transcripts), 16)]
-        max_len = max(max_len, max(len(tokenizer.encode(t)) for t in probe))
+    # Preserve iteration order so reducer masks align with lmprobe's flat
+    # union ordering of all prompts.
+    keys = list(prompt_groups.keys())
+    transcripts_flat: list[str] = []
+    boundaries_flat: list = []
+    for key in keys:
+        transcripts_flat.extend(prompt_groups[key])
+        boundaries_flat.extend(boundaries_groups[key])
+
+    probe = transcripts_flat[:min(len(transcripts_flat), 16)]
+    max_len = max(len(tokenizer.encode(t)) for t in probe)
     inner_bs = _pick_inner_bs(max_len)
 
-    total = sum(len(v) for v in prompt_groups.values())
-    keys = sorted(prompt_groups.keys())
+    total = len(transcripts_flat)
     logger.info(f"    sweep: {total} samples across {len(prompt_groups)} groups "
                 f"{keys} (max_len≈{max_len}, inner_bs={inner_bs})")
 
-    results = scan.batch_project_grouped(prompt_groups, batch_size=inner_bs)
+    masks_flat = _build_asst_masks_flat(
+        transcripts_flat, boundaries_flat, tokenizer,
+    )
 
-    n_layers = scan.n_layers
-    n_signals = len(scan.signals)
-    k = scan.n_components
-    sig_names = scan.signals
+    reducers = {
+        "last_token": LastTokenReducer(masks_flat),
+        "mean_asst":  MeanReducer(masks_flat),
+        "mean_excl5": MeanExclLastNReducer(masks_flat, n=5),
+    }
 
-    for key, (projections, coords, _tokens, seq_lengths) in results.items():
-        vecs = _aggregate_group_projections(
-            projections, coords, seq_lengths,
-            boundaries_groups[key],
-            n_layers, n_signals, k, sig_names,
-        )
+    results = scan.batch_project_reduced(
+        prompt_groups, reducers=reducers, batch_size=inner_bs,
+    )
+
+    # Cache on disk as float32 to preserve the historical cache dtype
+    # (reducers emit fp16; downstream probe code handles either, but
+    # fp32 matches existing .npz files bit-equivalently in shape/dtype).
+    for key in keys:
+        per_reducer = results[key]
         cache_path = cache_paths[key]
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             cache_path,
-            last_token=vecs["last_token"],
-            mean_asst=vecs["mean_asst"],
-            mean_excl5=vecs["mean_excl5"],
+            last_token=per_reducer["last_token"].astype(np.float32),
+            mean_asst=per_reducer["mean_asst"].astype(np.float32),
+            mean_excl5=per_reducer["mean_excl5"].astype(np.float32),
             labels=np.asarray(labels_groups[key]),
         )
-        logger.info(f"    cached {len(seq_lengths)} → {cache_path}")
+        logger.info(
+            f"    cached {per_reducer['last_token'].shape[0]} → {cache_path}",
+        )
 
     return total
 
 
+def _load_alpaca_val_corpus(model_key, tokenizer):
+    """Load the committed Alpaca-val split (seed=2026, 1000 samples/model).
+
+    Returns (transcripts, labels, boundaries). Labels are all zero — Alpaca
+    is the non-deceptive calibration corpus.
+    """
+    from datasets import load_from_disk
+    from on_policy_affirmation import get_assistant_turn_boundaries
+
+    split_file = Path("splits") / f"alpaca_{model_key}.json"
+    if not split_file.exists():
+        logger.error(f"No Alpaca splits at {split_file}. Run create_alpaca_splits.py first.")
+        return None
+    with open(split_file) as f:
+        splits = json.load(f)
+    val_indices = splits["val"]
+
+    loaded = load_from_disk("data/alpaca")
+    ds = loaded["test"] if hasattr(loaded, "keys") else loaded
+    ds_filtered = ds.filter(lambda x: x["model"] == model_key)
+
+    transcripts, labels, boundaries = [], [], []
+    for idx in val_indices:
+        row = ds_filtered[idx]
+        transcripts.append(
+            tokenizer.apply_chat_template(row["messages"], tokenize=False)
+        )
+        labels.append(0)
+        boundaries.append(
+            get_assistant_turn_boundaries(row["messages"], tokenizer)
+        )
+    return transcripts, np.array(labels), boundaries
+
+
+def _length_bucket_key(max_len):
+    """Bucket label by rough max sequence length. Same bucket → one sweep."""
+    if max_len > 1500:
+        return "long"
+    return "short"
+
+
 def cache_all(model_cfg, backend: str = "auto"):
-    """Fused GPU phase: project all LB splits + Alpaca via per-dataset sweeps.
+    """Fused GPU phase: project all LB splits + Alpaca-val through the
+    Alpaca basis in at most two length-bucketed sweeps per model.
 
-    Uses `SampleScan.batch_project_grouped` (lmprobe spec 001) once per
-    dataset so that all splits within a dataset pass through each loaded
-    layer-chunk before the next chunk loads. Same amortization pattern as
-    DiskOffloadBackend's `extract_all` — every model layer moves CPU→GPU
-    exactly once per dataset-level sweep, not once per split.
+    Flow:
+      1. Load the Alpaca basis at `scans/alpaca_{model}`.
+      2. Collect all uncached (dataset, split) groups: every LB split per
+         dataset plus Alpaca-val. Skip anything already cached.
+      3. Length-bucket groups by max sample length: short (<=1500 tokens)
+         and long (>1500). Each bucket runs one `batch_project_reduced`
+         sweep — one 80-layer streaming pass amortized over all samples
+         in that bucket.
+      4. Per-group PC vectors are dispatched to LastTokenReducer /
+         MeanReducer / MeanExclLastNReducer(n=5) on GPU and written to
+         `experiment_cache/{model}/{dataset}/{split}.npz` as fp32.
 
-    One sweep per dataset (rather than one giant sweep over everything) is
-    the memory-safe granularity. The full-union version would need to hold
-    the projection tensor + CPU-resident model weights + per-sample
-    intermediate residuals simultaneously; on a 128 GB box with IT-length
-    sequences this exceeds RAM and OOM-kills the process. Per-dataset
-    sweeps cap peak RAM at ~one dataset worth of projections while still
-    giving most of the amortization benefit relative to the old
-    per-split approach (e.g. ~5 sweeps instead of 12 for a fresh model).
-
-    Per-group results are sliced by lmprobe and aggregated here into the
-    three variants (last_token, mean_asst, mean_excl5), then written to
-    the same cache paths as the legacy `cache` + `alpaca` commands.
+    The length-bucketed fusion is a compromise: the single-sweep ideal
+    pins inner_bs=1 whenever any sample is >1500 tokens, which wrecks
+    throughput on short datasets (ID, Alpaca). Two buckets keeps the
+    short-sample sweep at inner_bs=4 while still amortizing the basis
+    streaming cost over all short-dataset samples at once.
     """
     model_name = model_cfg["hf_id"]
     model_key = model_cfg["dataset_key"]
     short = model_cfg["short"]
 
-    from datasets import load_from_disk
     from lmprobe import SampleScan
-    from on_policy_affirmation import get_assistant_turn_boundaries
 
-    scan_dir = f"scans/instructed-deception_{model_key}_holdout"
+    scan_dir = f"scans/alpaca_{model_key}"
     if not Path(scan_dir).exists():
-        logger.error(f"No ID basis found at {scan_dir}. Run the basis fit first.")
+        logger.error(
+            f"No Alpaca basis at {scan_dir}. Run "
+            f"`python fit_basis.py --model {model_key}` first."
+        )
         return
     scan = SampleScan(scan_dir, backend=backend)
     tokenizer = _load_tokenizer(model_name)
 
-    logger.info(f"=== {short}: per-dataset fused sweeps (backend={backend}) ===")
-    total_cached = 0
+    logger.info(f"=== {short}: fused projection through Alpaca basis (backend={backend}) ===")
 
-    # --- One fused sweep per dataset (fuses that dataset's splits) ---
+    prompt_groups: dict = {}
+    boundaries_groups: dict = {}
+    labels_groups: dict = {}
+    cache_paths: dict = {}
+
+    # --- Collect uncached LB splits ---
     for ds_name in DATASETS:
         splits = _load_split_indices(ds_name, model_key)
         if splits is None:
             logger.info(f"  {ds_name}: no split file, skipping")
             continue
-
-        prompt_groups: dict = {}
-        boundaries_groups: dict = {}
-        labels_groups: dict = {}
-        cache_paths: dict = {}
 
         for split_name, split_data in splits.items():
             cache_path = CACHE_DIR / model_key / ds_name / f"{split_name}.npz"
@@ -547,48 +350,52 @@ def cache_all(model_cfg, backend: str = "auto"):
             labels_groups[key] = labels
             cache_paths[key] = cache_path
 
-        if prompt_groups:
-            logger.info(f"  {ds_name}: sweeping {len(prompt_groups)} split(s)")
-            total_cached += _fused_sweep_and_cache(
-                scan, prompt_groups, boundaries_groups,
-                labels_groups, cache_paths, tokenizer,
-            )
-
-    # --- Alpaca in its own sweep (bounded-size control set) ---
-    alpaca_path = CACHE_DIR / model_key / "alpaca" / "control.npz"
-    if alpaca_path.exists():
-        logger.info("  alpaca/control: already cached")
+    # --- Add Alpaca-val (1% FPR calibration corpus) ---
+    alpaca_val_path = CACHE_DIR / model_key / "alpaca" / "val.npz"
+    if alpaca_val_path.exists():
+        logger.info("  alpaca/val: already cached")
     else:
-        loaded = load_from_disk("data/alpaca")
-        ds = loaded["test"] if isinstance(loaded, dict) else loaded
-        ds_filtered = ds.filter(lambda x: x["model"] == model_key)
-        if len(ds_filtered) > 0:
-            a_transcripts, a_labels, a_boundaries = [], [], []
-            for row in ds_filtered:
-                a_transcripts.append(
-                    tokenizer.apply_chat_template(row["messages"], tokenize=False)
-                )
-                a_labels.append(1 if row["deceptive"] else 0)
-                a_boundaries.append(
-                    get_assistant_turn_boundaries(row["messages"], tokenizer)
-                )
-            key = ("alpaca", "control")
-            logger.info("  alpaca: sweeping control set")
-            total_cached += _fused_sweep_and_cache(
-                scan,
-                {key: a_transcripts},
-                {key: a_boundaries},
-                {key: np.array(a_labels)},
-                {key: alpaca_path},
-                tokenizer,
-            )
-        else:
-            logger.warning(f"  alpaca/control: no rows for {model_key}")
+        loaded = _load_alpaca_val_corpus(model_key, tokenizer)
+        if loaded is not None:
+            a_transcripts, a_labels, a_boundaries = loaded
+            key = ("alpaca", "val")
+            prompt_groups[key] = a_transcripts
+            boundaries_groups[key] = a_boundaries
+            labels_groups[key] = a_labels
+            cache_paths[key] = alpaca_val_path
 
-    if total_cached == 0:
-        logger.info(f"=== {short}: everything already cached, nothing to do ===")
-    else:
-        logger.info(f"=== Done fused caching {short}: {total_cached} samples ===")
+    if not prompt_groups:
+        logger.info(f"  {short}: nothing to project — all splits already cached.")
+        return
+
+    # --- Bucket by max length, one fused sweep per bucket ---
+    group_max_len: dict = {}
+    for key, transcripts in prompt_groups.items():
+        probe = transcripts[:min(len(transcripts), 16)]
+        group_max_len[key] = max(len(tokenizer.encode(t)) for t in probe)
+
+    buckets: dict = {"short": [], "long": []}
+    for key in prompt_groups:
+        buckets[_length_bucket_key(group_max_len[key])].append(key)
+
+    total_cached = 0
+    for bucket_name, keys in buckets.items():
+        if not keys:
+            continue
+        bucket_groups = {k: prompt_groups[k] for k in keys}
+        bucket_boundaries = {k: boundaries_groups[k] for k in keys}
+        bucket_labels = {k: labels_groups[k] for k in keys}
+        bucket_cache_paths = {k: cache_paths[k] for k in keys}
+        logger.info(
+            f"  bucket={bucket_name}: sweeping {len(keys)} group(s) "
+            f"max_len={max(group_max_len[k] for k in keys)}"
+        )
+        total_cached += _fused_sweep_and_cache(
+            scan, bucket_groups, bucket_boundaries,
+            bucket_labels, bucket_cache_paths, tokenizer,
+        )
+
+    logger.info(f"=== {short}: done. {total_cached} samples projected ===")
 
 
 # ============================================================
@@ -604,409 +411,282 @@ def _load_cache(model_key, ds_name, split_name):
     return {k: d[k] for k in d.files}
 
 
-def select_probe(vecs, labels, aggregation="last_token"):
-    """Select best (layer, signal, PC, flip) from labeled data.
-
-    Returns a frozen probe dict.
-    """
-    data = vecs[aggregation]
-    n_layers = data.shape[1]
-    n_signals = data.shape[2]
-    k = data.shape[3]
-
-    best_auroc = 0.5
-    best = {"layer": 0, "signal": 0, "pc": 0, "flip": False, "auroc": 0.5}
-
-    for sig in range(n_signals):
-        for layer in range(n_layers):
-            for pc in range(k):
-                vals = data[:, layer, sig, pc]
-                if np.std(vals) < 1e-10:
-                    continue
-                try:
-                    auroc = roc_auc_score(labels, vals)
-                    flip = auroc < 0.5
-                    auroc_adj = 1.0 - auroc if flip else auroc
-                    if auroc_adj > best_auroc:
-                        best_auroc = auroc_adj
-                        best = {
-                            "layer": int(layer),
-                            "signal": int(sig),
-                            "pc": int(pc),
-                            "flip": bool(flip),
-                            "auroc": float(auroc_adj),
-                        }
-                except ValueError:
-                    continue
-
-    return best
+REDUCERS = ["last_token", "mean_asst", "mean_excl5"]
 
 
-def _score_probe(probe, vecs, aggregation="last_token"):
-    """Return per-sample scalar scores for a frozen probe (oriented so
-    higher = more deceptive)."""
-    data = vecs[aggregation]
-    scores = data[:, probe["layer"], probe["signal"], probe["pc"]].copy()
-    if probe["flip"]:
-        scores = -scores
-    return scores
-
-
-def calibrate_threshold_alpaca(alpaca_scores, target_fpr=ALPACA_FPR):
-    """Compute a decision threshold such that at most `target_fpr` of Alpaca
-    scores exceed it. Paper §5.1: 1% FPR on the per-model Alpaca control."""
-    # All Alpaca examples are negatives (control). Threshold = (1 - target_fpr)
-    # quantile of Alpaca scores. A higher score = more deceptive.
-    return float(np.quantile(alpaca_scores, 1.0 - target_fpr))
-
-
-def evaluate_frozen_probe(probe, vecs, labels, aggregation="last_token",
-                          alpaca_threshold=None):
-    """Evaluate a frozen probe on cached data. Returns metrics dict.
-
-    If `alpaca_threshold` is given, `bal_acc_1pct_fpr` and `recall_1pct_fpr`
-    use that threshold (paper-matching). Otherwise they use the in-sample
-    ROC-derived threshold (diagnostic only — NOT comparable to the paper).
-    """
-    scores = _score_probe(probe, vecs, aggregation=aggregation)
-    results = {}
-
-    # AUROC
-    try:
-        results["auroc"] = float(roc_auc_score(labels, scores))
-    except ValueError:
-        results["auroc"] = 0.5
-
-    # Balanced accuracy at median threshold
-    threshold = np.median(scores)
-    preds = (scores >= threshold).astype(int)
-    results["bal_acc_median"] = float(balanced_accuracy_score(labels, preds))
-
-    # 1% FPR threshold — paper-matching when alpaca_threshold is given
-    if alpaca_threshold is not None:
-        preds_1pct = (scores >= alpaca_threshold).astype(int)
-        results["bal_acc_1pct_fpr"] = float(balanced_accuracy_score(labels, preds_1pct))
-        results["recall_1pct_fpr"] = float(recall_score(labels, preds_1pct, zero_division=0))
-        results["threshold_1pct_fpr"] = float(alpaca_threshold)
-        results["threshold_source"] = "alpaca"
-
-    # In-sample 1% FPR (diagnostic only; NOT comparable to paper)
-    try:
-        fpr, tpr, thresholds = roc_curve(labels, scores)
-        idx = max(0, np.searchsorted(fpr, 0.01, side='right') - 1)
-        thresh = thresholds[min(idx, len(thresholds) - 1)]
-        preds_1pct_in = (scores >= thresh).astype(int)
-        results["bal_acc_1pct_fpr_insample"] = float(balanced_accuracy_score(labels, preds_1pct_in))
-        results["recall_1pct_fpr_insample"] = float(recall_score(labels, preds_1pct_in, zero_division=0))
-        if alpaca_threshold is None:
-            # Fallback: expose insample numbers under the canonical key with a source tag
-            results["bal_acc_1pct_fpr"] = results["bal_acc_1pct_fpr_insample"]
-            results["recall_1pct_fpr"] = results["recall_1pct_fpr_insample"]
-            results["threshold_1pct_fpr"] = float(thresh)
-            results["threshold_source"] = "insample"
-    except ValueError:
-        results["bal_acc_1pct_fpr_insample"] = 0.5
-        results["recall_1pct_fpr_insample"] = 0.0
-        if alpaca_threshold is None:
-            results["bal_acc_1pct_fpr"] = 0.5
-            results["recall_1pct_fpr"] = 0.0
-            results["threshold_1pct_fpr"] = 0.0
-            results["threshold_source"] = "insample"
-
-    # Optimal threshold (Youden's J)
-    try:
-        fpr, tpr, thresholds = roc_curve(labels, scores)
-        j_idx = np.argmax(tpr - fpr)
-        thresh_opt = thresholds[min(j_idx, len(thresholds) - 1)]
-        preds_opt = (scores >= thresh_opt).astype(int)
-        results["bal_acc_optimal"] = float(balanced_accuracy_score(labels, preds_opt))
-        results["f1_optimal"] = float(f1_score(labels, preds_opt, zero_division=0))
-    except ValueError:
-        results["bal_acc_optimal"] = 0.5
-        results["f1_optimal"] = 0.0
-
-    # Average precision
-    try:
-        results["avg_precision"] = float(average_precision_score(labels, scores))
-    except ValueError:
-        results["avg_precision"] = 0.0
-
-    return results
-
-
-# ============================================================
-# Baselines (CPU only, from cached vecs)
-# ============================================================
-
-def compute_dom_direction(vecs, labels, aggregation="last_token"):
-    """Difference-of-means baseline: one direction per (layer, signal)."""
-    data = vecs[aggregation]
-    dec_mask = labels == 1
-    truth_mask = labels == 0
-    dec_mean = data[dec_mask].mean(axis=0)   # [n_layers, n_signals, k]
-    truth_mean = data[truth_mask].mean(axis=0)
-    diff = dec_mean - truth_mean  # [n_layers, n_signals, k]
-    # Normalize per (layer, signal)
-    norms = np.linalg.norm(diff, axis=-1, keepdims=True)
-    norms = np.maximum(norms, 1e-10)
-    return diff / norms
-
-
-def evaluate_dom(dom_direction, vecs, labels, aggregation="last_token"):
-    """Evaluate difference-of-means: dot product with direction, pick best layer."""
-    data = vecs[aggregation]
-    n_layers = data.shape[1]
-    n_signals = data.shape[2]
-
-    # Score = dot(activation, direction) per (layer, signal)
-    # Pick best (layer, signal) on the data provided
-    best_auroc = 0.5
-    best = {"layer": 0, "signal": 0}
-
-    for sig in range(n_signals):
-        for layer in range(n_layers):
-            scores = (data[:, layer, sig, :] * dom_direction[layer, sig, :]).sum(axis=-1)
-            try:
-                auroc = roc_auc_score(labels, scores)
-                auroc = max(auroc, 1 - auroc)
-                if auroc > best_auroc:
-                    best_auroc = auroc
-                    best = {"layer": layer, "signal": sig}
-            except ValueError:
-                continue
-
-    # Evaluate at best (layer, signal)
-    scores = (data[:, best["layer"], best["signal"], :] *
-              dom_direction[best["layer"], best["signal"], :]).sum(axis=-1)
-    if roc_auc_score(labels, scores) < 0.5:
-        scores = -scores
-
-    return evaluate_frozen_probe(
-        {"layer": best["layer"], "signal": best["signal"], "pc": 0, "flip": False},
-        # Hack: create a single-PC view for the evaluate function
-        {"last_token": scores.reshape(-1, 1, 1, 1)},  # won't work directly
-        labels
-    ), best
-
-
-def _score_dom(dom_direction, frozen_layer, frozen_signal, vecs, aggregation="last_token"):
-    """Return per-sample DoM scalar scores (dot product with direction).
-
-    Orientation: direction is already dec_mean - truth_mean, so higher scores
-    are by construction more deceptive. No test-set flip.
-    """
-    data = vecs[aggregation]
-    d = dom_direction[frozen_layer, frozen_signal, :]
-    return (data[:, frozen_layer, frozen_signal, :] * d).sum(axis=-1)
-
-
-def evaluate_dom_frozen(dom_direction, frozen_layer, frozen_signal, vecs, labels,
-                         aggregation="last_token", alpaca_threshold=None):
-    """Evaluate DoM with a frozen (layer, signal) choice.
-
-    Orientation comes from `compute_dom_direction` (dec_mean - truth_mean), so
-    scores are already signed correctly — no test-set AUROC flip. If
-    `alpaca_threshold` is given, 1% FPR metrics use it; otherwise in-sample.
-    """
-    scores = _score_dom(dom_direction, frozen_layer, frozen_signal, vecs, aggregation=aggregation)
-
-    results = {}
-    try:
-        results["auroc"] = float(roc_auc_score(labels, scores))
-    except ValueError:
-        results["auroc"] = 0.5
-
-    threshold = np.median(scores)
-    preds = (scores >= threshold).astype(int)
-    results["bal_acc_median"] = float(balanced_accuracy_score(labels, preds))
-
-    if alpaca_threshold is not None:
-        preds_1pct = (scores >= alpaca_threshold).astype(int)
-        results["bal_acc_1pct_fpr"] = float(balanced_accuracy_score(labels, preds_1pct))
-        results["recall_1pct_fpr"] = float(recall_score(labels, preds_1pct, zero_division=0))
-        results["threshold_1pct_fpr"] = float(alpaca_threshold)
-        results["threshold_source"] = "alpaca"
-
-    try:
-        fpr, tpr, thresholds = roc_curve(labels, scores)
-        idx = max(0, np.searchsorted(fpr, 0.01, side='right') - 1)
-        thresh = thresholds[min(idx, len(thresholds) - 1)]
-        preds_1pct_in = (scores >= thresh).astype(int)
-        results["bal_acc_1pct_fpr_insample"] = float(balanced_accuracy_score(labels, preds_1pct_in))
-        results["recall_1pct_fpr_insample"] = float(recall_score(labels, preds_1pct_in, zero_division=0))
-        if alpaca_threshold is None:
-            results["bal_acc_1pct_fpr"] = results["bal_acc_1pct_fpr_insample"]
-            results["recall_1pct_fpr"] = results["recall_1pct_fpr_insample"]
-            results["threshold_1pct_fpr"] = float(thresh)
-            results["threshold_source"] = "insample"
-    except ValueError:
-        results["bal_acc_1pct_fpr_insample"] = 0.5
-        results["recall_1pct_fpr_insample"] = 0.0
-        if alpaca_threshold is None:
-            results["bal_acc_1pct_fpr"] = 0.5
-            results["recall_1pct_fpr"] = 0.0
-            results["threshold_1pct_fpr"] = 0.0
-            results["threshold_source"] = "insample"
-
-    return results
-
-
-# ============================================================
-# Main evaluation flow
-# ============================================================
-
-def _load_alpaca_cache(model_key):
-    """Load the Alpaca control cache for a model, or None if not cached."""
-    path = CACHE_DIR / model_key / "alpaca" / "control.npz"
+def _load_alpaca_val(model_key):
+    """Load the Alpaca-val cache (1000/model, non-deceptive, threshold calib)."""
+    path = CACHE_DIR / model_key / "alpaca" / "val.npz"
     if not path.exists():
         return None
     d = np.load(path)
     return {k: d[k] for k in d.files}
 
 
+def fit_linear_probes(train_vecs, train_labels):
+    """Fit L2 logistic regression on the 64-dim PC vector at each
+    (reducer, layer, signal). Returns dict[reducer] → (w [L, S, k], b [L, S]).
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    probes = {}
+    for reducer in REDUCERS:
+        if reducer not in train_vecs:
+            continue
+        data = train_vecs[reducer]  # [n, L, S, k]
+        _, L, S, k = data.shape
+        w = np.zeros((L, S, k), dtype=np.float32)
+        b = np.zeros((L, S), dtype=np.float32)
+        for layer in range(L):
+            for sig in range(S):
+                X = data[:, layer, sig, :]
+                if np.std(X) < 1e-10:
+                    continue
+                clf = LogisticRegression(
+                    max_iter=1000, C=1.0, solver="lbfgs",
+                ).fit(X, train_labels)
+                w[layer, sig, :] = clf.coef_[0]
+                b[layer, sig] = clf.intercept_[0]
+        probes[reducer] = (w, b)
+    return probes
+
+
+def compute_dom_probes(train_vecs, train_labels):
+    """Difference-of-means baseline on PC vectors. Same (w, b) shape as
+    logreg so the rest of the pipeline is reducer-agnostic. Orientation:
+    w = mean_dec − mean_truth, b = −<w, midpoint>. Higher score = more
+    deceptive by construction.
+    """
+    probes = {}
+    dec_mask = train_labels == 1
+    truth_mask = train_labels == 0
+    for reducer in REDUCERS:
+        if reducer not in train_vecs:
+            continue
+        data = train_vecs[reducer]
+        dec_mean = data[dec_mask].mean(axis=0)
+        truth_mean = data[truth_mask].mean(axis=0)
+        w = (dec_mean - truth_mean).astype(np.float32)
+        midpoint = 0.5 * (dec_mean + truth_mean)
+        b = (-np.einsum("lsk,lsk->ls", w, midpoint)).astype(np.float32)
+        probes[reducer] = (w, b)
+    return probes
+
+
+def score_probe(probes, reducer, layer, signal, vecs):
+    """Return per-sample scalar scores for a frozen (reducer, layer, signal).
+    Higher = more deceptive by logreg / DoM convention."""
+    w, b = probes[reducer]
+    X = vecs[reducer][:, layer, signal, :]
+    return X @ w[layer, signal, :] + b[layer, signal]
+
+
+def select_best_probe(probes, dev_vecs, dev_labels):
+    """Pick the (reducer, layer, signal) with max dev AUROC."""
+    best = {"auroc": 0.5, "reducer": REDUCERS[0], "layer": 0, "signal": 0}
+    for reducer in REDUCERS:
+        if reducer not in probes or reducer not in dev_vecs:
+            continue
+        w, b = probes[reducer]
+        data = dev_vecs[reducer]
+        _, L, S, _ = data.shape
+        for layer in range(L):
+            for sig in range(S):
+                scores = data[:, layer, sig, :] @ w[layer, sig, :] + b[layer, sig]
+                if np.std(scores) < 1e-10:
+                    continue
+                try:
+                    auroc = float(roc_auc_score(dev_labels, scores))
+                except ValueError:
+                    continue
+                if auroc > best["auroc"]:
+                    best = {"auroc": auroc, "reducer": reducer,
+                             "layer": int(layer), "signal": int(sig)}
+    return best
+
+
+def calibrate_threshold(alpaca_val_scores, target_fpr=ALPACA_FPR):
+    """Threshold = (1 − target_fpr) quantile of Alpaca-val probe scores.
+    Alpaca-val is all non-deceptive, so this pins FPR ≤ target on the
+    calibration corpus (paper §5.1)."""
+    return float(np.quantile(alpaca_val_scores, 1.0 - target_fpr))
+
+
+def evaluate_at_threshold(scores, labels, threshold):
+    """Compute AUROC + BalAcc/Recall at the frozen threshold."""
+    results = {}
+    try:
+        results["auroc"] = float(roc_auc_score(labels, scores))
+    except ValueError:
+        results["auroc"] = 0.5
+    preds = (scores >= threshold).astype(int)
+    results["bal_acc"] = float(balanced_accuracy_score(labels, preds))
+    results["recall"] = float(recall_score(labels, preds, zero_division=0))
+    try:
+        results["avg_precision"] = float(average_precision_score(labels, scores))
+    except ValueError:
+        results["avg_precision"] = 0.0
+    results["threshold"] = float(threshold)
+    return results
+
+
 def run_evaluate(model_cfg):
-    """Blinded evaluation: freeze probe on ID train/dev, evaluate everywhere."""
+    """Blinded evaluation:
+      1. Fit logreg probes on LB-ID train (per reducer, layer, signal).
+      2. Select (reducer, layer, signal) on LB-ID dev.
+      3. Calibrate 1% FPR threshold on Alpaca-val.
+      4. Evaluate on every LB held-out split (ID, HP-C, HP-KR, IT, …).
+    DoM baseline follows the same fit/select/calibrate/evaluate flow in
+    parallel — everything after the probe-fit step is shared.
+    """
     model_key = model_cfg["dataset_key"]
     short = model_cfg["short"]
 
     logger.info(f"=== Blinded evaluation: {short} ===")
 
-    # Load ID train and dev caches
     id_train = _load_cache(model_key, "instructed-deception", "train")
     id_dev = _load_cache(model_key, "instructed-deception", "dev")
+    alpaca_val = _load_alpaca_val(model_key)
 
     if id_train is None or id_dev is None:
-        logger.error(f"  Missing ID train/dev cache for {model_key}. Run 'cache' first.")
+        logger.error(
+            f"  Missing ID train/dev cache. Run `cache_all --model {model_key}` first."
+        )
+        return
+    if alpaca_val is None:
+        logger.error(
+            f"  Missing Alpaca-val cache at experiment_cache/{model_key}/alpaca/val.npz. "
+            f"Run `cache_all --model {model_key}` first."
+        )
         return
 
-    # Freeze probe on dev split (basis was fit on train, select direction on dev)
-    probe = select_probe(id_dev, id_dev["labels"], aggregation="last_token")
-    logger.info(f"  Frozen probe: layer={probe['layer']}, signal={probe['signal']}, "
-                f"pc={probe['pc']}, flip={probe['flip']}, dev_auroc={probe['auroc']:.3f}")
+    # --- Our method ---
+    logger.info("  Fitting logreg probes on ID-train...")
+    probes = fit_linear_probes(id_train, id_train["labels"])
+    best = select_best_probe(probes, id_dev, id_dev["labels"])
+    logger.info(
+        f"  Frozen probe: reducer={best['reducer']} layer={best['layer']} "
+        f"signal={best['signal']} dev_auroc={best['auroc']:.3f}"
+    )
+    probe_alpaca_scores = score_probe(
+        probes, best["reducer"], best["layer"], best["signal"], alpaca_val,
+    )
+    probe_threshold = calibrate_threshold(probe_alpaca_scores, target_fpr=ALPACA_FPR)
+    logger.info(
+        f"  Alpaca-val threshold (1% FPR, n={len(probe_alpaca_scores)}): "
+        f"τ={probe_threshold:.4f}"
+    )
 
-    # Also compute DoM direction on train split
-    dom_dir = compute_dom_direction(id_train, id_train["labels"], aggregation="last_token")
+    # --- DoM baseline ---
+    dom_probes = compute_dom_probes(id_train, id_train["labels"])
+    dom_best = select_best_probe(dom_probes, id_dev, id_dev["labels"])
+    logger.info(
+        f"  DoM baseline: reducer={dom_best['reducer']} layer={dom_best['layer']} "
+        f"signal={dom_best['signal']} dev_auroc={dom_best['auroc']:.3f}"
+    )
+    dom_alpaca_scores = score_probe(
+        dom_probes, dom_best["reducer"], dom_best["layer"], dom_best["signal"],
+        alpaca_val,
+    )
+    dom_threshold = calibrate_threshold(dom_alpaca_scores, target_fpr=ALPACA_FPR)
 
-    # --- Alpaca threshold calibration (paper §5.1: 1% FPR on model-generated Alpaca) ---
-    alpaca = _load_alpaca_cache(model_key)
-    probe_alpaca_thresh = None
-    dom_alpaca_thresh = None
-    if alpaca is None:
-        logger.warning(f"  No Alpaca cache for {model_key} at "
-                       f"{CACHE_DIR}/{model_key}/alpaca/control.npz — "
-                       f"falling back to in-sample 1% FPR. "
-                       f"Run `experiment_pipeline.py alpaca --model {model_key}` first "
-                       f"for paper-matching numbers.")
-    else:
-        probe_alpaca_scores = _score_probe(probe, alpaca, aggregation="last_token")
-        probe_alpaca_thresh = calibrate_threshold_alpaca(probe_alpaca_scores, target_fpr=ALPACA_FPR)
-        dom_alpaca_scores = _score_dom(
-            dom_dir, probe["layer"], probe["signal"], alpaca, aggregation="last_token"
-        )
-        dom_alpaca_thresh = calibrate_threshold_alpaca(dom_alpaca_scores, target_fpr=ALPACA_FPR)
-        logger.info(f"  Alpaca thresholds (1% FPR, n={len(probe_alpaca_scores)}): "
-                    f"probe={probe_alpaca_thresh:.4f}, dom={dom_alpaca_thresh:.4f}")
-
-    # Evaluate on all datasets and splits
+    # --- Evaluate on LB splits ---
     results = {}
     for ds_name in DATASETS:
         for split_name in ["dev", "held_out"]:
             cache = _load_cache(model_key, ds_name, split_name)
             if cache is None:
                 continue
-
-            key = f"{ds_name}/{split_name}"
             labels = cache["labels"]
+            key = f"{ds_name}/{split_name}"
 
-            # Our method (frozen probe)
-            for agg in ["last_token", "mean_asst", "mean_excl5"]:
-                metrics = evaluate_frozen_probe(
-                    probe, cache, labels, aggregation=agg,
-                    alpaca_threshold=probe_alpaca_thresh,
-                )
-                results[f"{key}/ours/{agg}"] = metrics
-
-            # DoM baseline (frozen layer/signal from probe)
-            dom_metrics = evaluate_dom_frozen(
-                dom_dir, probe["layer"], probe["signal"],
-                cache, labels, aggregation="last_token",
-                alpaca_threshold=dom_alpaca_thresh,
+            ours_scores = score_probe(
+                probes, best["reducer"], best["layer"], best["signal"], cache,
             )
-            results[f"{key}/dom/last_token"] = dom_metrics
+            results[f"{key}/ours"] = evaluate_at_threshold(
+                ours_scores, labels, probe_threshold,
+            )
 
-        logger.info(f"  {ds_name}: done")
+            dom_scores = score_probe(
+                dom_probes, dom_best["reducer"], dom_best["layer"], dom_best["signal"],
+                cache,
+            )
+            results[f"{key}/dom"] = evaluate_at_threshold(
+                dom_scores, labels, dom_threshold,
+            )
 
-    # Save results
     out_path = Path("results") / f"blinded_eval_{model_key}.json"
+    out_path.parent.mkdir(exist_ok=True)
     with open(out_path, "w") as f:
         json.dump({
-            "probe": probe,
-            "alpaca_threshold_probe": probe_alpaca_thresh,
-            "alpaca_threshold_dom": dom_alpaca_thresh,
-            "threshold_source": "alpaca" if probe_alpaca_thresh is not None else "insample",
+            "probe": {
+                "reducer": best["reducer"], "layer": best["layer"],
+                "signal": best["signal"], "dev_auroc": best["auroc"],
+                "threshold": probe_threshold,
+            },
+            "dom": {
+                "reducer": dom_best["reducer"], "layer": dom_best["layer"],
+                "signal": dom_best["signal"], "dev_auroc": dom_best["auroc"],
+                "threshold": dom_threshold,
+            },
             "results": results,
         }, f, indent=2)
     logger.info(f"  Saved → {out_path}")
 
-    # Print summary table
-    logger.info(f"\n  === {short} Blinded Results (last_token) ===")
+    logger.info(
+        f"\n  === {short} Blinded Results (probe reducer={best['reducer']}) ==="
+    )
     logger.info(f"  {'Dataset/Split':<45s} {'AUROC':>7s} {'BA@1%':>7s} {'Recall':>7s}")
     for ds_name in DATASETS:
-        for split_name in ["held_out"]:
-            key = f"{ds_name}/{split_name}/ours/last_token"
-            if key in results:
-                r = results[key]
-                logger.info(f"  {ds_name}/{split_name:<25s} {r['auroc']:7.3f} "
-                            f"{r['bal_acc_1pct_fpr']:7.3f} {r['recall_1pct_fpr']:7.3f}")
-
-    logger.info(f"\n  === {short} DoM Baseline (last_token) ===")
-    logger.info(f"  {'Dataset/Split':<45s} {'AUROC':>7s} {'BA@1%':>7s} {'Recall':>7s}")
-    for ds_name in DATASETS:
-        for split_name in ["held_out"]:
-            key = f"{ds_name}/{split_name}/dom/last_token"
-            if key in results:
-                r = results[key]
-                logger.info(f"  {ds_name}/{split_name:<25s} {r['auroc']:7.3f} "
-                            f"{r['bal_acc_1pct_fpr']:7.3f} {r['recall_1pct_fpr']:7.3f}")
-
-    # Aggregation ablation
-    logger.info(f"\n  === {short} Aggregation Ablation (ID held_out) ===")
-    for agg in ["last_token", "mean_asst", "mean_excl5"]:
-        key = f"instructed-deception/held_out/ours/{agg}"
+        key = f"{ds_name}/held_out/ours"
         if key in results:
             r = results[key]
-            logger.info(f"  {agg:<20s} AUROC={r['auroc']:.3f} BA@1%={r['bal_acc_1pct_fpr']:.3f}")
+            logger.info(
+                f"  {ds_name + '/held_out':<45s} {r['auroc']:7.3f} "
+                f"{r['bal_acc']:7.3f} {r['recall']:7.3f}"
+            )
 
+    logger.info(
+        f"\n  === {short} DoM Baseline (reducer={dom_best['reducer']}) ==="
+    )
+    for ds_name in DATASETS:
+        key = f"{ds_name}/held_out/dom"
+        if key in results:
+            r = results[key]
+            logger.info(
+                f"  {ds_name + '/held_out':<45s} {r['auroc']:7.3f} "
+                f"{r['bal_acc']:7.3f} {r['recall']:7.3f}"
+            )
     return results
 
 
-# ============================================================
-# Scrambled-label sanity check (Experiment 5)
-# ============================================================
-
-def run_sanity_check(model_cfg, n_permutations=100):
-    """Scrambled-label control: what AUROC do we get with random labels?"""
+def run_sanity_check(model_cfg, n_permutations=50):
+    """Scrambled-label control: shuffle ID-train labels, refit probe, select
+    on dev. Expected AUROC ≈ 0.5 + multiple-testing drift. Materially higher
+    indicates a pipeline bug."""
     model_key = model_cfg["dataset_key"]
     short = model_cfg["short"]
 
+    id_train = _load_cache(model_key, "instructed-deception", "train")
     id_dev = _load_cache(model_key, "instructed-deception", "dev")
-    if id_dev is None:
-        logger.error(f"  Missing ID dev cache for {model_key}")
+    if id_train is None or id_dev is None:
+        logger.error(f"  Missing ID train/dev cache for {model_key}")
         return
 
     rng = np.random.RandomState(42)
     null_aurocs = []
-
     for _ in range(n_permutations):
-        shuffled = rng.permutation(id_dev["labels"])
-        probe = select_probe(id_dev, shuffled, aggregation="last_token")
-        null_aurocs.append(probe["auroc"])
+        shuffled = rng.permutation(id_train["labels"])
+        probes = fit_linear_probes(id_train, shuffled)
+        best = select_best_probe(probes, id_dev, id_dev["labels"])
+        null_aurocs.append(best["auroc"])
 
     null_aurocs = np.array(null_aurocs)
-    logger.info(f"  {short} scrambled-label AUROC: "
-                f"mean={null_aurocs.mean():.3f} std={null_aurocs.std():.3f} "
-                f"max={null_aurocs.max():.3f} (should be ~0.5-0.65 from multiple testing)")
-
+    logger.info(
+        f"  {short} scrambled-label AUROC: "
+        f"mean={null_aurocs.mean():.3f} std={null_aurocs.std():.3f} "
+        f"max={null_aurocs.max():.3f}"
+    )
     return null_aurocs
 
 
@@ -1016,38 +696,26 @@ def run_sanity_check(model_cfg, n_permutations=100):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["cache", "alpaca", "cache_all",
-                                             "evaluate", "sanity", "ablations"])
+    parser.add_argument("command", choices=["cache_all", "evaluate", "sanity"])
     parser.add_argument("--model", type=str, default="all")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--backend", type=str, default="auto",
                         choices=["auto", "chunked", "disk_offload"],
-                        help="Projection backend (cache_all only). 'auto' picks "
-                             "via lmprobe heuristic; 'disk_offload' is safer for "
-                             "large sample counts × long sequences.")
+                        help="Projection backend (cache_all only).")
     args = parser.parse_args()
 
     models_to_run = list(MODELS.keys()) if args.model == "all" else [args.model]
-
     for model_key in models_to_run:
         if model_key not in MODELS:
             logger.error(f"Unknown model: {model_key}")
             continue
         cfg = MODELS[model_key]
-
-        if args.command == "cache":
-            cache_projections(cfg)
-        elif args.command == "alpaca":
-            cache_alpaca(cfg)
-        elif args.command == "cache_all":
+        if args.command == "cache_all":
             cache_all(cfg, backend=args.backend)
         elif args.command == "evaluate":
             run_evaluate(cfg)
         elif args.command == "sanity":
             run_sanity_check(cfg)
-        elif args.command == "ablations":
-            # TODO: layer-fixed-at-20th-percentile, different aggregations, etc.
-            run_evaluate(cfg)
 
 
 if __name__ == "__main__":
