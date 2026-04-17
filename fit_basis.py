@@ -41,11 +41,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import load_from_disk
-from transformers import AutoTokenizer
-
 from lmprobe import SampleScan
 
 from on_policy_affirmation import _template_to_ids, get_assistant_turn_boundaries
+from util import safe_load_tokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -85,7 +84,7 @@ def _load_tokenizer(model_name: str):
     Mistral-Small-3.1 and some other releases ship the chat template as a
     separate file rather than in tokenizer_config.json.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = safe_load_tokenizer(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.chat_template is None:
