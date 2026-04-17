@@ -116,16 +116,19 @@ def _build_alpaca_train_corpus(model_key: str, tokenizer):
     return prompts, labels, masks
 
 
-def fit_basis(model_cfg: dict, device: str = "cuda:0", force: bool = False) -> SampleScan:
+def fit_basis(model_cfg: dict, device: str = "cuda:0", force: bool = False,
+              backend_override: str | None = None) -> SampleScan:
     """Fit the Alpaca-train PCA basis for a model and write to disk.
 
     Returns the fitted SampleScan. If an existing scan is present and
-    `force=False`, reuses it rather than refitting.
+    `force=False`, reuses it rather than refitting. `backend_override`
+    overrides the per-model default (useful when chunked OOMs on long
+    Alpaca sequences — disk_offload frees the ~48 GB model footprint).
     """
     model_name = model_cfg["hf_id"]
     model_key = model_cfg["dataset_key"]
     short = model_cfg["short"]
-    backend_type = model_cfg["backend"]
+    backend_type = backend_override or model_cfg["backend"]
 
     scan_dir = Path("scans") / f"alpaca_{model_key}"
 
@@ -137,6 +140,18 @@ def fit_basis(model_cfg: dict, device: str = "cuda:0", force: bool = False) -> S
     tokenizer = _load_tokenizer(model_name)
     prompts, labels, masks = _build_alpaca_train_corpus(model_key, tokenizer)
 
+    # Alpaca transcripts are ~300 tokens mean, ~550 p99 — 3–5x longer than
+    # LB-ID prompts. With cuml enabled, the PCA fit runs on GPU and the
+    # CPU-side `stacked`+`flat` materialization is eliminated, so we can
+    # use a larger chunk_size than we could under the sklearn path. The
+    # remaining CPU ceiling is the captures list (bf16, accumulated during
+    # forward pass before any PCA fit): chunk_size × 2 × N × padded_seq ×
+    # hidden × 2 bytes, which for chunk_size=4 on Alpaca/Mistral is ~50 GB
+    # alongside the 48 GB model — comfortable under 128 GB.
+    chunked_kwargs = (
+        {"batch_size": 4, "chunk_size": 4}
+        if backend_type == "chunked" else {"batch_size": 4}
+    )
     scan = SampleScan.run(
         prompts=prompts,
         labels=labels,
@@ -148,6 +163,7 @@ def fit_basis(model_cfg: dict, device: str = "cuda:0", force: bool = False) -> S
         dtype=torch.bfloat16,
         generative_masks=masks,
         backend=backend_type,
+        **chunked_kwargs,
     )
     logger.info(f"=== {short}: basis fit. "
                 f"{scan.n_layers} layers, {scan.n_samples} samples → {scan_dir} ===")
@@ -161,6 +177,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--force", action="store_true",
                         help="Refit even if a scan already exists")
+    parser.add_argument("--backend", type=str, default=None,
+                        choices=[None, "chunked", "disk_offload"],
+                        help="Override the per-model backend default.")
     args = parser.parse_args()
 
     models = list(MODELS.keys()) if args.model == "all" else [args.model]
@@ -168,7 +187,8 @@ def main():
         if model_key not in MODELS:
             logger.error(f"Unknown model: {model_key}")
             continue
-        fit_basis(MODELS[model_key], device=args.device, force=args.force)
+        fit_basis(MODELS[model_key], device=args.device, force=args.force,
+                  backend_override=args.backend)
 
 
 if __name__ == "__main__":
